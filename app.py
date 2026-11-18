@@ -19,8 +19,12 @@ SNOW CAST  -  複数予報モデル統合による降雪確率サイト (Python 
   - 湿球温度しきい値・モデル重み・確率補正(Platt)を実測から再学習（/api/retrain）
 
 起動:  python app.py          (開発)
-       gunicorn app:app       (本番)
+       gunicorn app:app --workers 1 --threads 4 --timeout 120   (本番)
+       ※ workers は 1 に固定（バックグラウンド処理が各ワーカーで重複するため）。
+         threads を増やすと、予報取得中でも /health や画面が固まらない。
 環境変数: SNOWCAST_DB (DBパス), SNOWCAST_BG=0 (バックグラウンド処理を無効化), PORT
+    SNOWCAST_ADMIN_TOKEN   設定すると /api/retrain と /api/observe にトークンが必要になる
+                           (ヘッダ X-Admin-Token または ?token=)。公開URLで運用するなら設定推奨
   Render無料プラン対策（永続ディスクなしでも検証データを残す）:
     SNOWCAST_BACKUP_REPO   例 "yourname/snowcast"   DBバックアップ先のGitHubリポジトリ
     SNOWCAST_BACKUP_TOKEN  Contents の Read/Write 権限を持つ fine-grained トークン
@@ -32,6 +36,7 @@ SNOW CAST  -  複数予報モデル統合による降雪確率サイト (Python 
 import atexit
 import base64
 import gzip
+import hmac
 import json
 import logging
 import math
@@ -40,6 +45,7 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from urllib import error as urlerror
 from urllib import parse as urlparse
@@ -85,6 +91,7 @@ CAL_MIN_N = 300             # 確率補正を学習する最小サンプル数�
 CAL_MIN_EVENTS = 20         # 同・雪イベント最小数
 
 DEFAULT_PARAMS = {"thr": 0.8, "scale": 0.6}   # 湿球温度しきい値(℃) と 遷移幅
+STALE_MAX = 7200            # この秒数以内なら古い予報を即返し、裏で更新（取得失敗時の代替も兼ねる）
 CACHE_TTL = 1800            # 予報キャッシュ 秒
 SNAPSHOT_INTERVAL_H = 6     # 検証用スナップショット間隔
 SNAPSHOT_MAX_LEAD = 168     # 記録するリード時間
@@ -93,6 +100,7 @@ BACKUP_REPO = os.environ.get("SNOWCAST_BACKUP_REPO", "")
 BACKUP_TOKEN = os.environ.get("SNOWCAST_BACKUP_TOKEN", "")
 BACKUP_BRANCH = os.environ.get("SNOWCAST_BACKUP_BRANCH", "snowcast-data")
 BACKUP_FILE = "snowcast.sqlite.gz"
+ADMIN_TOKEN = os.environ.get("SNOWCAST_ADMIN_TOKEN", "")
 BACKUP_INTERVAL_H = float(os.environ.get("SNOWCAST_BACKUP_H", "6"))
 DB_PATH = os.environ.get("SNOWCAST_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "snowcast.sqlite"))
 
@@ -109,6 +117,8 @@ except Exception:
 _db_lock = threading.Lock()
 _fc_lock = threading.Lock()
 _cache = {"time": 0, "data": None}
+_train_lock = threading.Lock()
+_refreshing = threading.Event()
 
 
 # ----------------------------------------------------------------------------
@@ -244,15 +254,26 @@ def lead_factor(kind, lead):
 # ----------------------------------------------------------------------------
 # DB
 # ----------------------------------------------------------------------------
+@contextmanager
 def db():
+    """コミット/ロールバックして必ず close する（標準の with sqlite3.connect は close しない）。"""
     con = sqlite3.connect(DB_PATH, timeout=30)
     con.row_factory = sqlite3.Row
-    return con
+    try:
+        yield con
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
 
 
 def init_db():
     with _db_lock, db() as con:
+        con.execute("PRAGMA journal_mode=WAL")     # 読み書きの同時実行でロックしにくくする
         con.executescript("""
+        CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE IF NOT EXISTS fc_snap(
             issue TEXT, target TEXT, model TEXT, lead INTEGER,
             temp REAL, rh REAL, precip REAL, t850 REAL, tw REAL, p_snow REAL,
@@ -283,6 +304,33 @@ def get_params():
     except Exception:
         pass
     return p
+
+
+def kv_get(key):
+    try:
+        with db() as con:
+            row = con.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+            return row["value"] if row else None
+    except Exception:
+        return None
+
+
+def kv_set(key, value):
+    with _db_lock, db() as con:
+        con.execute("INSERT OR REPLACE INTO kv VALUES (?,?)", (key, value))
+
+
+def load_persisted_forecast():
+    """再起動/スリープ明けでも直近の予報をすぐ返せるよう、DBに保存した最後の予報を読み込む。"""
+    raw = kv_get("last_forecast")
+    if not raw:
+        return
+    try:
+        js = json.loads(raw)
+        _cache.update({"time": float(js["saved"]), "data": js["data"]})
+        log.info("last forecast loaded from DB (age %d min)", (time.time() - _cache["time"]) / 60)
+    except Exception as e:  # noqa
+        log.warning("persisted forecast unreadable: %s", e)
 
 
 def get_weights():
@@ -363,6 +411,11 @@ def db_restore():
             chk.execute("SELECT COUNT(*) FROM obs").fetchone()
         finally:
             chk.close()
+        for ext in ("-wal", "-shm"):
+            try:
+                os.remove(DB_PATH + ext)
+            except OSError:
+                pass
         os.replace(tmp, DB_PATH)
         _last_backup = time.time()
         log.info("DB restored from GitHub backup (%d bytes)", len(raw))
@@ -758,12 +811,50 @@ def last_issue():
         return None
 
 
+def _stale_copy():
+    age = time.time() - _cache["time"]
+    return dict(_cache["data"], stale=True, age_min=int(age // 60))
+
+
+def _refresh_async():
+    """古いキャッシュを返しつつ、裏で1本だけ更新を走らせる。"""
+    if _refreshing.is_set():
+        return
+    _refreshing.set()
+
+    def run():
+        try:
+            get_forecast(force=True)
+        except Exception as e:  # noqa
+            log.warning("async refresh failed: %s", e)
+        finally:
+            _refreshing.clear()
+    threading.Thread(target=run, daemon=True, name="snowcast-refresh").start()
+
+
 def get_forecast(force=False):
+    if not force and _cache["data"]:
+        age = time.time() - _cache["time"]
+        if age < CACHE_TTL:
+            return _cache["data"]
+        if age < STALE_MAX:             # 待たせず古いデータを返し、裏で更新
+            _refresh_async()
+            return _stale_copy()
     with _fc_lock:
         if not force and _cache["data"] and time.time() - _cache["time"] < CACHE_TTL:
             return _cache["data"]
-        out, snap_rows, final_rows = build_forecast()
+        try:
+            out, snap_rows, final_rows = build_forecast()
+        except Exception:
+            if _cache["data"] and time.time() - _cache["time"] < STALE_MAX:
+                log.warning("forecast refresh failed; serving stale cache")
+                return _stale_copy()
+            raise
         _cache.update({"time": time.time(), "data": out})
+        try:
+            kv_set("last_forecast", json.dumps({"saved": _cache["time"], "data": out}, ensure_ascii=False))
+        except Exception as e:  # noqa
+            log.warning("persist forecast failed: %s", e)
         li = last_issue()
         due = True
         if li:
@@ -966,7 +1057,7 @@ def fit_calibration():
     return out
 
 
-def retrain():
+def _retrain():
     """実測に基づき 湿球温度しきい値・遷移幅 を再推定し、モデル重み・確率補正を更新する。"""
     res = {"params": None, "weights": {}}
     with db() as con:
@@ -1011,8 +1102,17 @@ def retrain():
                            (m, w, len(per[m]), b, now_jst().strftime("%Y-%m-%d %H:%M")))
                 res["weights"][m] = r(w, 2)
     res["calib"] = fit_calibration()
-    _cache["time"] = 0
+    _refresh_async()    # 新しいパラメータで予報を作り直す（古い予報は作り直し完了まで返し続ける）
     return res
+
+
+def retrain():
+    if not _train_lock.acquire(blocking=False):
+        return {"status": "busy"}
+    try:
+        return _retrain()
+    finally:
+        _train_lock.release()
 
 
 # ----------------------------------------------------------------------------
@@ -1044,9 +1144,25 @@ def bg_loop():
 # ----------------------------------------------------------------------------
 # API
 # ----------------------------------------------------------------------------
+def qint(name, default, lo, hi):
+    try:
+        v = int(request.args.get(name, default))
+    except (TypeError, ValueError):
+        v = default
+    return max(lo, min(hi, v))
+
+
+def authorized():
+    if not ADMIN_TOKEN:
+        return True
+    tok = request.headers.get("X-Admin-Token") or request.args.get("token", "")
+    return hmac.compare_digest(tok.encode("utf-8"), ADMIN_TOKEN.encode("utf-8"))
+
+
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "time": now_jst().isoformat()})
+    age = int((time.time() - _cache["time"]) // 60) if _cache["data"] else None
+    return jsonify({"ok": True, "time": now_jst().isoformat(), "forecast_age_min": age})
 
 
 @app.route("/api/forecast")
@@ -1060,7 +1176,7 @@ def api_forecast():
 
 @app.route("/api/observations")
 def api_observations():
-    hours = int(request.args.get("hours", 48))
+    hours = qint("hours", 48, 1, 720)
     since = tstr(hour_floor() - timedelta(hours=hours))
     with db() as con:
         n = con.execute("SELECT COUNT(*) c FROM obs").fetchone()["c"]
@@ -1077,6 +1193,8 @@ def api_observations():
 @app.route("/api/observe", methods=["POST"])
 def api_observe():
     """目視などの雪の有無を手動登録。{"time":"2026-12-01T09:00","snow":true}"""
+    if not authorized():
+        return jsonify({"error": "unauthorized"}), 401
     js = request.get_json(force=True, silent=True) or {}
     t = str(js.get("time", ""))[:13] + ":00"
     try:
@@ -1094,11 +1212,13 @@ def api_observe():
 
 @app.route("/api/verification")
 def api_verification():
-    return jsonify(verification(int(request.args.get("days", 30))))
+    return jsonify(verification(qint("days", 30, 1, 365)))
 
 
 @app.route("/api/retrain", methods=["GET", "POST"])
 def api_retrain():
+    if not authorized():
+        return jsonify({"error": "unauthorized"}), 401
     return jsonify(retrain())
 
 
@@ -1147,6 +1267,7 @@ th:first-child,td:first-child{text-align:left;white-space:nowrap}
 .canvas{position:relative;height:300px}
 .tag{display:inline-block;font-size:11px;padding:1px 6px;border-radius:6px;background:#1b3454;color:var(--sub);margin-left:4px}
 .err{color:var(--warn)}
+.btn:disabled{opacity:.5;cursor:wait}
 </style>
 </head>
 <body>
@@ -1213,7 +1334,7 @@ function drawHour(){
 }
 
 function render(){
-  const f=FC; $('#gen').textContent='更新 '+f.generated_at+'（JST） / 湿球温度しきい値 '+f.params.thr+'℃ / 確率補正: '+(Object.keys(f.calib||{}).length?'実測で学習済み':'未学習（データ蓄積中）');
+  const f=FC; $('#gen').textContent='更新 '+f.generated_at+'（JST） / 湿球温度しきい値 '+f.params.thr+'℃ / 確率補正: '+(Object.keys(f.calib||{}).length?'実測で学習済み':'未学習（データ蓄積中）')+(f.stale?' / ⚠ 約'+f.age_min+'分前のデータを表示中（更新中）':'');
   const H=f.hourly.filter(h=>h.p!=null);
   const m24=Math.max(...H.slice(0,24).map(h=>h.p));
   const nextSnow=H.find(h=>h.p>=0.3);
@@ -1270,16 +1391,47 @@ async function loadObs(){
 }
 document.querySelectorAll('[data-r]').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('[data-r]').forEach(x=>x.classList.remove('on'));b.classList.add('on');RANGE=+b.dataset.r;drawHour();});
-$('#btnTrain').onclick=async()=>{ $('#trainRes').textContent='実行中…';
-  const r=await fetch('/api/retrain',{method:'POST'}).then(r=>r.json()); $('#trainRes').textContent=JSON.stringify({params:r.params,calib:r.calib});};
+function showErr(m){const g=$('#gen');g.textContent='';const e=document.createElement('span');e.className='err';e.textContent=m;g.appendChild(e);}
+const tok=()=>sessionStorage.getItem('adm')||'';
+async function trainReq(){
+  const h={}; if(tok()) h['X-Admin-Token']=tok();
+  let res=await fetch('/api/retrain',{method:'POST',headers:h});
+  if(res.status===401){
+    const t=prompt('管理トークンを入力してください'); if(!t) throw new Error('キャンセルしました');
+    sessionStorage.setItem('adm',t);
+    res=await fetch('/api/retrain',{method:'POST',headers:{'X-Admin-Token':t}});
+    if(res.status===401){sessionStorage.removeItem('adm'); throw new Error('トークンが違います');}
+  }
+  if(!res.ok) throw new Error('HTTP '+res.status);
+  return res.json();
+}
+function fmtTrain(r){
+  if(r.status==='busy') return '別の学習が実行中です';
+  const p=r.params||{}, out=[];
+  out.push(p.status ? p.status+'（'+p.n+'件）' : '湿球しきい値 '+p.thr+'℃ / 遷移幅 '+p.scale+'（'+p.n+'件）');
+  const c=Object.entries(r.calib||{}).map(([b,v])=>b+': '+(v.status?'データ不足('+v.n+'件)':'学習済(a='+v.a+', b='+v.b+')'));
+  if(c.length) out.push('補正 '+c.join(' / '));
+  return out.join(' ｜ ');
+}
+$('#btnTrain').onclick=async()=>{
+  const b=$('#btnTrain'); b.disabled=true; $('#trainRes').textContent='実行中…';
+  try{ $('#trainRes').textContent=fmtTrain(await trainReq()); loadVer().catch(()=>{}); setTimeout(loadForecast,30000); }
+  catch(e){ $('#trainRes').textContent='失敗: '+e.message; }
+  finally{ b.disabled=false; }
+};
+async function loadForecast(){
+  try{
+    const j=await fetch('/api/forecast').then(r=>r.json());
+    if(j.error){ if(!FC) showErr('取得エラー: '+j.error); return; }
+    FC=j; render();
+  }catch(e){ if(!FC) showErr(String(e)); }
+}
 
 (async()=>{
-  try{
-    const r=await fetch('/api/forecast'); FC=await r.json();
-    if(FC.error){$('#gen').innerHTML='<span class="err">取得エラー: '+FC.error+'</span>';return;}
-    render();
-  }catch(e){$('#gen').innerHTML='<span class="err">'+e+'</span>';}
-  loadVer(); loadObs().catch(()=>{});
+  await loadForecast();
+  loadVer().catch(()=>{$('#ver').textContent='検証データを取得できませんでした';});
+  loadObs().catch(()=>{});
+  setInterval(loadForecast, 30*60*1000);
 })();
 </script>
 </body></html>
@@ -1296,6 +1448,7 @@ def index():
 # ----------------------------------------------------------------------------
 db_restore()
 init_db()
+load_persisted_forecast()
 if os.environ.get("SNOWCAST_BG", "1") != "0":
     threading.Thread(target=bg_loop, daemon=True, name="snowcast-bg").start()
     _ka = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("SNOWCAST_KEEPALIVE_URL")
