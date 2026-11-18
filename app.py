@@ -21,8 +21,17 @@ SNOW CAST  -  複数予報モデル統合による降雪確率サイト (Python 
 起動:  python app.py          (開発)
        gunicorn app:app       (本番)
 環境変数: SNOWCAST_DB (DBパス), SNOWCAST_BG=0 (バックグラウンド処理を無効化), PORT
+  Render無料プラン対策（永続ディスクなしでも検証データを残す）:
+    SNOWCAST_BACKUP_REPO   例 "yourname/snowcast"   DBバックアップ先のGitHubリポジトリ
+    SNOWCAST_BACKUP_TOKEN  Contents の Read/Write 権限を持つ fine-grained トークン
+    SNOWCAST_BACKUP_BRANCH (既定 snowcast-data) / SNOWCAST_BACKUP_H (既定 6 時間ごと)
+    SNOWCAST_KEEP_DAYS     (既定 120) 記録保持日数。バックアップを軽くしたいときは 60 など
+    RENDER_EXTERNAL_URL    Renderが自動設定。あれば10分おきに自分の /health を叩きスリープを防ぐ
 依存: flask (標準ライブラリのみ他に不要)
 """
+import atexit
+import base64
+import gzip
 import json
 import logging
 import math
@@ -32,6 +41,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
@@ -78,7 +88,12 @@ DEFAULT_PARAMS = {"thr": 0.8, "scale": 0.6}   # 湿球温度しきい値(℃) �
 CACHE_TTL = 1800            # 予報キャッシュ 秒
 SNAPSHOT_INTERVAL_H = 6     # 検証用スナップショット間隔
 SNAPSHOT_MAX_LEAD = 168     # 記録するリード時間
-KEEP_DAYS = 120             # 記録保持日数
+KEEP_DAYS = int(os.environ.get("SNOWCAST_KEEP_DAYS", "120"))   # 記録保持日数
+BACKUP_REPO = os.environ.get("SNOWCAST_BACKUP_REPO", "")
+BACKUP_TOKEN = os.environ.get("SNOWCAST_BACKUP_TOKEN", "")
+BACKUP_BRANCH = os.environ.get("SNOWCAST_BACKUP_BRANCH", "snowcast-data")
+BACKUP_FILE = "snowcast.sqlite.gz"
+BACKUP_INTERVAL_H = float(os.environ.get("SNOWCAST_BACKUP_H", "6"))
 DB_PATH = os.environ.get("SNOWCAST_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "snowcast.sqlite"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -306,6 +321,120 @@ def calibrate(p, lead, calib):
     if p < CAL_EPS:     # 降水なし等の極小確率は連続的に比例縮小/拡大
         return min(1.0, p * f(CAL_EPS) / CAL_EPS)
     return f(p)
+
+
+# ----------------------------------------------------------------------------
+# DBバックアップ/復元（Render無料プランはディスクが再起動で消えるため、GitHubに退避）
+#   専用ブランチに「親なし1コミット」を強制更新するので、リポジトリ履歴が肥大化しない。
+# ----------------------------------------------------------------------------
+_backup_lock = threading.Lock()
+_last_backup = 0.0
+
+
+def backup_enabled():
+    return bool(BACKUP_REPO and BACKUP_TOKEN)
+
+
+def _gh(method, path, body=None, accept="application/vnd.github+json", timeout=60):
+    url = "https://api.github.com/repos/%s%s" % (BACKUP_REPO, path)
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {"Authorization": "Bearer " + BACKUP_TOKEN, "Accept": accept,
+               "User-Agent": "SNOWCAST/1.0", "X-GitHub-Api-Version": "2022-11-28"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urlrequest.Request(url, data=data, method=method, headers=headers)
+    with urlrequest.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def db_restore():
+    """DBファイルが無いとき（=再起動直後）だけ、GitHubのバックアップから復元する。"""
+    global _last_backup
+    if not backup_enabled() or os.path.exists(DB_PATH):
+        return False
+    try:
+        raw = _gh("GET", "/contents/%s?ref=%s" % (BACKUP_FILE, urlparse.quote(BACKUP_BRANCH)),
+                  accept="application/vnd.github.raw+json", timeout=90)
+        tmp = DB_PATH + ".restore"
+        with open(tmp, "wb") as f:
+            f.write(gzip.decompress(raw))
+        chk = sqlite3.connect(tmp)
+        try:
+            chk.execute("SELECT COUNT(*) FROM obs").fetchone()
+        finally:
+            chk.close()
+        os.replace(tmp, DB_PATH)
+        _last_backup = time.time()
+        log.info("DB restored from GitHub backup (%d bytes)", len(raw))
+        return True
+    except urlerror.HTTPError as e:
+        if e.code == 404:
+            log.info("no DB backup found yet (first run)")
+        else:
+            log.warning("DB restore failed: HTTP %s", e.code)
+    except Exception as e:  # noqa
+        log.warning("DB restore failed: %s", e)
+    return False
+
+
+def db_backup(force=False):
+    """DBを一貫したコピーにして gzip し、GitHubの専用ブランチへ上書き保存する。"""
+    global _last_backup
+    if not backup_enabled() or not os.path.exists(DB_PATH):
+        return False
+    if not _backup_lock.acquire(blocking=False):
+        return False
+    tmp = DB_PATH + ".bak"
+    try:
+        if not force and time.time() - _last_backup < BACKUP_INTERVAL_H * 3600:
+            return False
+        src, dst = sqlite3.connect(DB_PATH, timeout=30), sqlite3.connect(tmp)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        with open(tmp, "rb") as f:
+            payload = gzip.compress(f.read(), 6)
+        blob = json.loads(_gh("POST", "/git/blobs",
+                              {"content": base64.b64encode(payload).decode("ascii"), "encoding": "base64"}))
+        del payload
+        tree = json.loads(_gh("POST", "/git/trees", {"tree": [
+            {"path": BACKUP_FILE, "mode": "100644", "type": "blob", "sha": blob["sha"]}]}))
+        commit = json.loads(_gh("POST", "/git/commits", {
+            "message": "snowcast db backup " + now_jst().strftime("%Y-%m-%d %H:%M"),
+            "tree": tree["sha"], "parents": []}))
+        ref = "refs/heads/" + BACKUP_BRANCH
+        try:
+            _gh("PATCH", "/git/" + ref, {"sha": commit["sha"], "force": True})
+        except urlerror.HTTPError as e:
+            if e.code in (404, 422):    # ブランチ未作成
+                _gh("POST", "/git/refs", {"ref": ref, "sha": commit["sha"]})
+            else:
+                raise
+        _last_backup = time.time()
+        log.info("DB backup uploaded")
+        return True
+    except Exception as e:  # noqa
+        log.warning("DB backup failed: %s", e)
+        return False
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        _backup_lock.release()
+
+
+def keepalive_loop(url):
+    """Render無料プランのスリープ（15分無アクセス）対策。自分の /health を定期的に叩く。"""
+    while True:
+        time.sleep(600)
+        try:
+            http_get(url.rstrip("/") + "/health", timeout=15, retries=0)
+        except Exception as e:  # noqa
+            log.warning("keepalive failed: %s", e)
 
 
 # ----------------------------------------------------------------------------
@@ -908,6 +1037,7 @@ def bg_loop():
                 last_train_day = today
         except Exception as e:  # noqa
             log.warning("retrain failed: %s", e)
+        db_backup()     # 6時間ごと（SNOWCAST_BACKUP_H）。未設定なら何もしない
         time.sleep(1800)
 
 
@@ -1164,9 +1294,15 @@ def index():
 # ----------------------------------------------------------------------------
 # 起動
 # ----------------------------------------------------------------------------
+db_restore()
 init_db()
 if os.environ.get("SNOWCAST_BG", "1") != "0":
     threading.Thread(target=bg_loop, daemon=True, name="snowcast-bg").start()
+    _ka = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("SNOWCAST_KEEPALIVE_URL")
+    if _ka:
+        threading.Thread(target=keepalive_loop, args=(_ka,), daemon=True, name="snowcast-keepalive").start()
+    if backup_enabled():
+        atexit.register(lambda: db_backup(force=True))   # デプロイ/停止時に最後の退避
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
