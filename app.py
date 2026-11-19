@@ -91,7 +91,7 @@ CAL_MIN_N = 300             # 確率補正を学習する最小サンプル数�
 CAL_MIN_EVENTS = 20         # 同・雪イベント最小数
 
 DEFAULT_PARAMS = {"thr": 0.8, "scale": 0.6}   # 湿球温度しきい値(℃) と 遷移幅
-STALE_MAX = 7200            # この秒数以内なら古い予報を即返し、裏で更新（取得失敗時の代替も兼ねる）
+STALE_MAX = 21600           # この秒数以内なら古い予報を即返し、裏で更新（取得失敗時の代替も兼ねる）
 CACHE_TTL = 1800            # 予報キャッシュ 秒
 SNAPSHOT_INTERVAL_H = 6     # 検証用スナップショット間隔
 SNAPSHOT_MAX_LEAD = 168     # 記録するリード時間
@@ -154,10 +154,12 @@ def http_get(url, params=None, timeout=25, retries=2):
             last = RuntimeError("HTTP %s: %s" % (e.code, str(reason)[:160]))
             if 400 <= e.code < 500 and e.code != 429:
                 break                       # 入力不正は再試行しても同じ
-            time.sleep((3.0 if e.code == 429 else 0.8) * (k + 1))
+            if k < retries:
+                time.sleep((3.0 if e.code == 429 else 0.8) * (k + 1))
         except Exception as e:  # noqa
             last = e
-            time.sleep(0.8 * (k + 1))
+            if k < retries:
+                time.sleep(0.8 * (k + 1))
     raise last
 
 
@@ -531,6 +533,8 @@ def fetch_det(model):
             return out
         except Exception as e:  # noqa
             last = e
+            if not (isinstance(e, ValueError) or str(e).startswith("HTTP 400")):
+                break
     raise last
 
 
@@ -825,8 +829,12 @@ def last_issue():
 
 
 def _stale_copy():
+    """古い予報を返すとき、過ぎた時刻の時間別データは落として『いま』が先頭になるようにする。"""
     age = time.time() - _cache["time"]
-    return dict(_cache["data"], stale=True, age_min=int(age // 60))
+    now_t = tstr(hour_floor())
+    d = dict(_cache["data"], stale=True, age_min=int(age // 60))
+    d["hourly"] = [h for h in d["hourly"] if h["time"] >= now_t]
+    return d
 
 
 def _refresh_async():
@@ -846,6 +854,7 @@ def _refresh_async():
 
 
 def get_forecast(force=False):
+    t0 = time.time()
     if not force and _cache["data"]:
         age = time.time() - _cache["time"]
         if age < CACHE_TTL:
@@ -854,7 +863,8 @@ def get_forecast(force=False):
             _refresh_async()
             return _stale_copy()
     with _fc_lock:
-        if not force and _cache["data"] and time.time() - _cache["time"] < CACHE_TTL:
+        # 待っている間に別スレッドが更新済みなら、二重に取得しない
+        if _cache["data"] and (_cache["time"] >= t0 or (not force and time.time() - _cache["time"] < CACHE_TTL)):
             return _cache["data"]
         try:
             out, snap_rows, final_rows = build_forecast()
@@ -1132,17 +1142,16 @@ def retrain():
 # バックグラウンド処理
 # ----------------------------------------------------------------------------
 def bg_loop():
-    time.sleep(5)
     last_train_day = None
     while True:
-        try:
-            ingest_obs()
-        except Exception as e:  # noqa
-            log.warning("ingest_obs failed: %s", e)
         try:
             get_forecast(force=True)
         except Exception as e:  # noqa
             log.warning("forecast refresh failed: %s", e)
+        try:
+            ingest_obs()
+        except Exception as e:  # noqa
+            log.warning("ingest_obs failed: %s", e)
         try:
             today = now_jst().strftime("%Y-%m-%d")
             if last_train_day != today and now_jst().hour >= 4:
@@ -1250,7 +1259,7 @@ INDEX_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0b1424">
 <title>SNOW CAST - 甲府の降雪確率</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
 <style>
 :root{--bg:#0b1424;--bg2:#101d33;--ln:#1f3350;--tx:#f2f7ff;--sub:#8ea3c0;--ice:#9fd3ff;--warm:#ffc27a;--ok:#7be0a1;
 --r:16px}
@@ -1395,10 +1404,11 @@ const heat=p=>`rgba(159,211,255,${(0.10+0.85*p).toFixed(2)})`;
 const ico=p=>p>=.6?'❄️':p>=.3?'🌨️':p>=.1?'🌥️':'';
 const word=p=>p>=.6?'雪の可能性が高い':p>=.3?'雪になりそう':p>=.1?'わずかに可能性':'雪なし';
 let FC=null, RANGE=48, TAB='fc', VERLOADED=false;
-Chart.defaults.color=TICK; Chart.defaults.font.family='inherit';
+(()=>{const s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js';
+  s.onload=()=>{Chart.defaults.color=TICK;Chart.defaults.font.family='inherit';draw();};document.head.appendChild(s);})();
 
-function mk(id,cfg){ if(charts[id]) charts[id].destroy(); charts[id]=new Chart($(id),cfg); }
-function showErr(m){const g=$('#gen');g.textContent='';const e=document.createElement('span');e.className='err';e.textContent=m;g.appendChild(e);$('#headline').textContent='予報を取得できません';}
+function mk(id,cfg){ if(!window.Chart) return; if(charts[id]) charts[id].destroy(); charts[id]=new Chart($(id),cfg); }
+function showErr(m){const g=$('#gen');g.textContent='';const e=document.createElement('span');e.className='err';e.textContent=m;g.appendChild(e);$('#headline').textContent='予報を読み込み中です…';}
 
 /* ---------- ヒーロー ---------- */
 function drawHero(){
@@ -1507,7 +1517,7 @@ async function loadForecast(force){
   const b=$('#btnRefresh'); b.disabled=true; b.textContent=force?'更新中…':'更新';
   try{
     const j=await fetch('/api/forecast'+(force?'?refresh=1':'')).then(r=>r.json());
-    if(j.error){ if(!FC) showErr('取得エラー: '+j.error); return; }
+    if(j.error){ if(!FC){ showErr(j.error); setTimeout(()=>loadForecast(false),8000); } return; }
     FC=j; drawHero(); draw();
   }catch(e){ if(!FC) showErr(String(e)); }
   finally{ b.disabled=false; b.textContent='更新'; }
@@ -1561,11 +1571,36 @@ def index():
 # ----------------------------------------------------------------------------
 # 起動
 # ----------------------------------------------------------------------------
-db_restore()
-init_db()
-load_persisted_forecast()
-if os.environ.get("SNOWCAST_BG", "1") != "0":
-    threading.Thread(target=bg_loop, daemon=True, name="snowcast-bg").start()
+_BG = os.environ.get("SNOWCAST_BG", "1") != "0"
+_ready = threading.Event()
+
+
+def _startup():
+    """DB復元(GitHubから最大90秒)などの重い準備はポートを開いたあとに行う。
+    トップページ(HTML)は準備を待たずに返し、/api/* だけ準備完了まで待たせる。"""
+    try:
+        db_restore()
+        init_db()
+        load_persisted_forecast()
+    except Exception:  # noqa
+        log.exception("startup failed")
+    finally:
+        _ready.set()
+    if _BG:
+        bg_loop()
+
+
+@app.before_request
+def _wait_ready():
+    if request.path.startswith("/api/") and not _ready.wait(90):
+        return jsonify({"error": "起動中です。数秒後に自動で再試行します"}), 503
+
+
+if _BG:
+    threading.Thread(target=_startup, daemon=True, name="snowcast-bg").start()
+else:
+    _startup()
+if _BG:
     _ka = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("SNOWCAST_KEEPALIVE_URL")
     if _ka:
         threading.Thread(target=keepalive_loop, args=(_ka,), daemon=True, name="snowcast-keepalive").start()
