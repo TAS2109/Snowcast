@@ -1106,7 +1106,7 @@ def build_forecast(det=None, ens=None, errors=None, start=None, fresh=False):
             "wind": al(tm, r_.get("wind_speed_10m")), "cloud": al(tm, r_.get("cloud_cover")),
             "fsnow": al(tm, r_.get("snowfall")), "frz": al(tm, r_.get("freezing_level_height")),
         }
-        srcs.append({"key": key, "label": label, "kind": "det", "members": [mem]})
+        srcs.append({"key": key, "label": label, "kind": "det", "members": [mem], "grid": r_.get("grid")})
     for key, label in ENS_MODELS:
         r_ = ens.get(key)
         if not r_:
@@ -1120,7 +1120,7 @@ def build_forecast(det=None, ens=None, errors=None, start=None, fresh=False):
                 "t850": al(tm, m["temperature_850hPa"]) if m.get("temperature_850hPa") else None,
                 "wind": [None] * n, "cloud": [None] * n, "fsnow": [None] * n, "frz": [None] * n,
             })
-        srcs.append({"key": "ens_" + key, "label": label, "kind": "ens", "members": mems})
+        srcs.append({"key": "ens_" + key, "label": label, "kind": "ens", "members": mems, "grid": r_.get("grid")})
 
     # 日付グループ
     day_idx = {}
@@ -1269,7 +1269,7 @@ def build_forecast(det=None, ens=None, errors=None, start=None, fresh=False):
     for s in srcs:
         models.append({
             "key": s["key"], "label": s["label"], "kind": s["kind"], "members": len(s["members"]),
-            "weight": r(s["w"], 2), "hours": sum(1 for v in s["m"]["ps"] if v is not None),
+            "weight": r(s["w"], 2), "grid": s.get("grid"), "hours": sum(1 for v in s["m"]["ps"] if v is not None),
         })
     for k, msg in errors.items():
         models.append({"key": k, "label": k, "kind": "error", "error": msg})
@@ -1911,6 +1911,15 @@ padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
 display:flex;gap:6px;overflow-x:auto;border-bottom:1px solid var(--ln)}
 .tab{flex:1;min-width:76px;border:0;background:transparent;color:var(--sub);font-size:14px;font-weight:600;padding:9px 10px;border-radius:10px;cursor:pointer}
 .tab[aria-selected=true]{background:var(--ice);color:#06223a}
+.mapctl{background:var(--bg2);border:1px solid var(--ln);border-radius:12px;padding:8px 12px}
+.mapctl summary{cursor:pointer;font-weight:600;font-size:14px}
+.mapgrp{font-size:12px;color:var(--sub);margin:10px 0 4px}
+.mapopts{display:flex;flex-wrap:wrap;gap:6px 14px}
+.mapopts label{display:inline-flex;align-items:center;gap:5px;font-size:13.5px;cursor:pointer;min-height:28px}
+.mapopts input{width:16px;height:16px;accent-color:var(--ice)}
+.mapopts .sub{margin-left:4px;color:var(--sub)}
+.leaflet-tooltip.mt{background:#0b1424;color:#f2f7ff;border:1px solid #1f3350;font-size:11px;padding:1px 4px;box-shadow:none}
+.leaflet-tooltip.mt:before{display:none}
 .subtabs{margin:10px 0 0;display:flex;gap:6px;overflow-x:auto}
 .subtabs[hidden]{display:none}
 .subtab{border:1px solid var(--ln);background:var(--bg2);color:var(--sub);border-radius:999px;padding:6px 14px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}
@@ -2051,7 +2060,15 @@ th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:
 
 <section id="s-map">
 <h2>マップ</h2>
-<div class="note">準備中です。ここに雨雲レーダー・アメダス・各モデルの予報などを重ねて表示できるようにする予定です。</div>
+<details class="mapctl" id="mapCtl" open><summary>表示する情報</summary>
+<div class="mapgrp">背景</div>
+<div class="mapopts" id="mapBase"></div>
+<div class="mapgrp">重ねる情報（チェックで表示）</div>
+<div class="mapopts" id="mapOv"></div>
+</details>
+<div id="mapMain" style="height:460px;border-radius:12px;overflow:hidden;margin-top:8px"></div>
+<div class="row" id="mapRadRow" style="margin-top:8px" hidden><button class="iconbtn" id="mapRadPlay">再生</button><span class="note" id="mapRadTime"></span></div>
+<div class="note" id="mapNote"></div>
 </section>
 
 <section id="s-trend">
@@ -2347,14 +2364,115 @@ async function initRadar(){
   setInterval(()=>{ if(TAB=='live' && !document.hidden) radarRefresh(); },300000);
 }
 
+/* ---------- マップ ---------- */
+const MAPV={map:null,base:null,layers:{},radar:null,frames:[],i:0,timer:null,sel:{}};
+const MAP_BASES=[['pale','淡色地図','https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png'],
+  ['std','標準地図','https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png'],
+  ['photo','航空写真','https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg'],
+  ['relief','陰影起伏','https://cyberjapandata.gsi.go.jp/xyz/hillshademap/{z}/{x}/{y}.png']];
+const MAP_OVS=[
+  ['radar','雨雲レーダー（実況＋1時間先）',true],
+  ['ame_snow','アメダス: 雪の有無',true],
+  ['ame_temp','アメダス: 気温',false],
+  ['ame_depth','アメダス: 積雪深',false],
+  ['point','予報地点（甲府）',true],
+  ['grid','予報モデルの格子点',false]];
+function mapLoad(){ try{ return JSON.parse(localStorage.getItem('mapsel')||'null'); }catch(e){ return null; } }
+function mapSave(){ try{ localStorage.setItem('mapsel',JSON.stringify(MAPV.sel)); }catch(e){} }
+function mapBuildUi(){
+  const saved=mapLoad()||{};
+  MAPV.sel={base:MAP_BASES.some(b=>b[0]==saved.base)?saved.base:'pale'};
+  MAP_OVS.forEach(o=>MAPV.sel[o[0]]=saved[o[0]]!=null?!!saved[o[0]]:o[2]);
+  $('#mapBase').innerHTML=MAP_BASES.map(b=>`<label><input type="radio" name="mapbase" value="${b[0]}"${MAPV.sel.base==b[0]?' checked':''}>${b[1]}</label>`).join('');
+  $('#mapOv').innerHTML=MAP_OVS.map(o=>`<label><input type="checkbox" data-ov="${o[0]}"${MAPV.sel[o[0]]?' checked':''}>${o[1]}</label>`).join('');
+  $('#mapBase').onchange=e=>{ if(e.target.name=='mapbase'){ MAPV.sel.base=e.target.value; mapSave(); mapApplyBase(); } };
+  $('#mapOv').onchange=e=>{ const k=e.target.dataset.ov; if(!k) return; MAPV.sel[k]=e.target.checked; mapSave(); mapApplyOv(k); };
+  $('#mapRadPlay').onclick=()=>{
+    if(MAPV.timer){ clearInterval(MAPV.timer); MAPV.timer=null; $('#mapRadPlay').textContent='再生'; return; }
+    $('#mapRadPlay').textContent='停止';
+    MAPV.timer=setInterval(()=>mapRadarShow((MAPV.i+1)%Math.max(1,MAPV.frames.length)),700);
+  };
+}
+function mapApplyBase(){
+  const b=MAP_BASES.find(x=>x[0]==MAPV.sel.base)||MAP_BASES[0];
+  if(MAPV.base) MAPV.map.removeLayer(MAPV.base);
+  MAPV.base=L.tileLayer(b[2],{minZoom:4,maxZoom:14,maxNativeZoom:b[0]=='relief'?13:(b[0]=='photo'?17:18),attribution:'地理院タイル'}).addTo(MAPV.map);
+  MAPV.base.bringToBack();
+}
+function mapRadarShow(i){
+  const f=MAPV.frames[i]; if(!f||!MAPV.map) return; MAPV.i=i;
+  if(MAPV.radar) MAPV.map.removeLayer(MAPV.radar);
+  MAPV.radar=L.tileLayer('https://www.jma.go.jp/bosai/jmatile/data/nowc/'+f.b+'/none/'+f.v+'/surf/hrpns/{z}/{x}/{y}.png',{opacity:.75,minZoom:4,maxZoom:12,maxNativeZoom:10}).addTo(MAPV.map);
+  $('#mapRadTime').textContent=jt(f.v)+(f.fc?'（予測）':'（実況）')+'　'+(i+1)+'/'+MAPV.frames.length;
+}
+async function mapRadarOn(){
+  $('#mapRadRow').hidden=false;
+  try{
+    if(!MAPV.frames.length) MAPV.frames=await radarFrames();
+    if(!MAPV.frames.length) throw new Error('no frames');
+    if(!MAPV.sel.radar) return;
+    const now=MAPV.frames.findIndex(f=>f.fc); mapRadarShow(now>0?now-1:MAPV.frames.length-1);
+  }catch(e){ $('#mapRadTime').innerHTML='<span class="err">レーダー画像を取得できませんでした。</span>'; }
+}
+function mapRadarOff(){
+  if(MAPV.timer){ clearInterval(MAPV.timer); MAPV.timer=null; $('#mapRadPlay').textContent='再生'; }
+  if(MAPV.radar){ MAPV.map.removeLayer(MAPV.radar); MAPV.radar=null; }
+  $('#mapRadRow').hidden=true;
+}
+const MAPN=(v,u)=>v==null?'-':v+u;
+function mapBuildLayer(k){
+  const loc=(FC&&FC.location)||{lat:35.6642,lon:138.5683}, g=L.layerGroup();
+  const rows=((LIVE&&LIVE.nearby&&LIVE.nearby.rows)||[]).filter(x=>x.lat!=null&&x.lon!=null);
+  if(k=='point'){
+    L.circleMarker([loc.lat,loc.lon],{radius:7,color:'#fff',weight:2,fillColor:'#ff5a5a',fillOpacity:1}).bindTooltip((loc.name||'予報地点')+'（予報地点）',{className:'mt'}).addTo(g);
+  }else if(k=='ame_snow'){
+    rows.forEach(x=>{ const c=x.snow==null?'#8896a8':(x.snow?'#9fd3ff':'#ffc27a');
+      L.circleMarker([x.lat,x.lon],{radius:x.snow?7:5,color:'#0b1424',weight:1,fillColor:c,fillOpacity:.95})
+       .bindPopup(`<b>${esc(x.name)}</b>　${x.dist}km・標高${MAPN(x.alt,'m')}<br>雪判定: ${x.snow==null?'-':(x.snow?'雪':'なし')}${x.basis?'（'+x.basis+'）':''}<br>気温 ${MAPN(x.temp,'℃')} ／ 降水1h ${MAPN(x.precip1h,'mm')} ／ 積雪深 ${MAPN(x.snow_depth,'cm')} ／ 風 ${MAPN(x.wind,'m/s')}`).addTo(g); });
+  }else if(k=='ame_temp'||k=='ame_depth'){
+    const key=k=='ame_temp'?'temp':'snow_depth', u=k=='ame_temp'?'':'cm';
+    rows.filter(x=>x[key]!=null).forEach(x=>{
+      L.circleMarker([x.lat,x.lon],{radius:1,opacity:0,fillOpacity:0,interactive:false}).bindTooltip(x[key]+u,{permanent:true,direction:k=='ame_temp'?'right':'bottom',offset:[k=='ame_temp'?5:0,k=='ame_temp'?0:5],className:'mt'}).addTo(g); });
+  }else if(k=='grid'){
+    const seen={};
+    ((FC&&FC.models)||[]).filter(m=>m.grid&&m.grid.lat!=null).forEach(m=>{
+      const id=m.grid.lat.toFixed(3)+','+m.grid.lon.toFixed(3); (seen[id]=seen[id]||{g:m.grid,n:[]}).n.push(m.label); });
+    Object.values(seen).forEach(o=>{
+      L.circleMarker([o.g.lat,o.g.lon],{radius:4,color:'#fff',weight:1,fillColor:'#c9a6ff',fillOpacity:.85})
+       .bindPopup(`<b>格子点 ${o.g.lat.toFixed(2)}, ${o.g.lon.toFixed(2)}</b><br>${o.n.map(esc).join('<br>')}`).addTo(g); });
+  }
+  return g;
+}
+async function mapApplyOv(k){
+  if(!MAPV.map) return;
+  if(k=='radar'){ if(MAPV.sel.radar) mapRadarOn(); else mapRadarOff(); return; }
+  if(MAPV.layers[k]){ MAPV.map.removeLayer(MAPV.layers[k]); delete MAPV.layers[k]; }
+  if(!MAPV.sel[k]) return;
+  if(k.startsWith('ame_')){ try{ await ensureLive(); }catch(e){ $('#mapNote').innerHTML='<span class="err">アメダスを取得できませんでした。</span>'; return; } }
+  if(!MAPV.sel[k]||MAPV.layers[k]) return;
+  MAPV.layers[k]=mapBuildLayer(k).addTo(MAPV.map);
+  if(k!='ame_snow') MAPV.layers[k].eachLayer(l=>l.bringToFront&&l.bringToFront());
+}
+async function drawMap(){
+  if(MAPV.map){ MAPV.map.invalidateSize(); return; }
+  if(MAPV.starting) return; MAPV.starting=true;
+  try{ await loadLeaflet(); }catch(e){ $('#mapNote').textContent='地図ライブラリを読み込めませんでした。'; MAPV.starting=false; return; }
+  mapBuildUi();
+  const loc=(FC&&FC.location)||{lat:35.6642,lon:138.5683};
+  MAPV.map=L.map('mapMain').setView([loc.lat,loc.lon],8);
+  mapApplyBase();
+  MAP_OVS.forEach(o=>{ if(MAPV.sel[o[0]]) mapApplyOv(o[0]); });
+  $('#mapNote').textContent='アメダスの点はタップすると詳細が出ます。雨雲レーダーは気象庁、背景は国土地理院のタイルです。公式予報・観測は参考表示で、降雪確率の計算には使っていません。';
+  MAPV.starting=false;
+}
+
 /* ---------- 実況・公式 ---------- */
 let LIVE=null;
+async function ensureLive(){ if(!LIVE) LIVE=await fetch('/api/live').then(r=>r.json()); return LIVE; }
 async function drawLive(){
   initRadar();
-  if(!LIVE){
-    try{ LIVE=await fetch('/api/live').then(r=>r.json()); }
-    catch(e){ $('#liveWarn').textContent='取得できませんでした。しばらくしてから再度開いてください。'; return; }
-  }
+  try{ await ensureLive(); }
+  catch(e){ $('#liveWarn').textContent='取得できませんでした。しばらくしてから再度開いてください。'; return; }
   const O=LIVE.official||{}, N=LIVE.nearby||{}, W=O.warnings, S=O.short;
   $('#liveWarn').innerHTML = !W ? '<span class="err">'+esc(O.warning_error||'警報・注意報を取得できませんでした')+'</span>'
     : (W.items.length ? W.items.map(w=>`<span class="tag" style="font-size:13px;${w.snow?'background:#ffc27a;color:#3a2200':''}">${esc(w.name)}</span>`).join(' ')+`<div class="note">${esc(W.report.replace('T',' '))} 発表</div>`
@@ -2377,7 +2495,7 @@ async function drawLive(){
 /* ---------- タブ・操作 ---------- */
 function draw(){
   if(!FC) return;
-  if(TAB=='fc') drawFc(); else if(TAB=='snow') drawSnow(); else if(TAB=='model') drawModel(); else if(TAB=='data') drawData(); else if(TAB=='trend') drawTrendTab(); else if(TAB=='live') drawLive(); else if(TAB=='mem') drawMem(); else if(TAB=='var') drawVar();
+  if(TAB=='fc') drawFc(); else if(TAB=='snow') drawSnow(); else if(TAB=='model') drawModel(); else if(TAB=='data') drawData(); else if(TAB=='trend') drawTrendTab(); else if(TAB=='map') drawMap(); else if(TAB=='live') drawLive(); else if(TAB=='mem') drawMem(); else if(TAB=='var') drawVar();
   else if(TAB=='ver' && !VERLOADED){VERLOADED=true; loadVer().catch(()=>{$('#ver').textContent='検証データを取得できませんでした。しばらくしてから再度開いてください。';VERLOADED=false;}); loadObs().catch(()=>{});}
 }
 const COLS=[['time','時刻',h=>hh(h.time)],['p','降雪確率',h=>pct(h.p)],['lo','最小',h=>pct(h.lo)],['hi','最大',h=>pct(h.hi)],
