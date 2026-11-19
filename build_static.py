@@ -29,6 +29,7 @@ def static_html(src):
     pairs = [
         ("fetch('/api/verification?days=30')", "fetch('data/verification.json?'+Date.now())"),
         ("fetch('/api/observations?hours=36')", "fetch('data/observations.json?'+Date.now())"),
+        ("fetch('/api/trend')", "fetch('data/trend.json?'+Date.now())"),
         ("fetch('/api/forecast'+(force?'?refresh=1':''))", "fetch('data/forecast.json?'+Date.now())"),
     ]
     for old, new in pairs:
@@ -81,9 +82,10 @@ def main(patch=None):
     with A.db() as con:
         obs = [dict(x) for x in con.execute("SELECT * FROM obs WHERE time>=? ORDER BY time", (since,))]
     ver = A.verification(30)
+    trend = A.forecast_trend()
 
     os.makedirs(os.path.join(SITE, "data"), exist_ok=True)
-    for name, obj in (("forecast", fc), ("verification", ver), ("observations", {"rows": obs})):
+    for name, obj in (("forecast", fc), ("verification", ver), ("observations", {"rows": obs}), ("trend", trend)):
         with open(os.path.join(SITE, "data", name + ".json"), "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
     with open(os.path.join(SITE, "index.html"), "w", encoding="utf-8") as f:
