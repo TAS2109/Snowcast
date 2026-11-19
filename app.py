@@ -32,6 +32,9 @@ SNOW CAST  -  複数予報モデル統合による降雪確率サイト (Python 
     SNOWCAST_BACKUP_BRANCH (既定 snowcast-data) / SNOWCAST_BACKUP_H (既定 6 時間ごと)
     SNOWCAST_KEEP_DAYS     (既定 120) 記録保持日数。バックアップを軽くしたいときは 60 など
     RENDER_EXTERNAL_URL    Renderが自動設定。あれば10分おきに自分の /health を叩きスリープを防ぐ
+予想バトル（降る/降らないを予想して勝負）
+  - 判定用に /api/daily（日ごとの実況まとめ）を提供。予想の保存・ランキングは各ブラウザ側(localStorage)で行い、
+    友達とはリンク(#play=...)で共有する。サーバーに個人データは保存しない
 依存: flask (標準ライブラリのみ他に不要)
 """
 import atexit
@@ -1291,6 +1294,50 @@ def api_observations():
     return jsonify({"rows": rows})
 
 
+def daily_results(days=60):
+    """日ごとの実況まとめ（予想バトルの判定用）。
+    status: snow    = その日に雪判定の時間が1時間でもある（その時点で確定）
+            none    = 日が終わっていて、判定できた時間が18時間以上あり雪判定なし
+            pending = まだ決められない（今日の途中・実測の欠け）"""
+    today = now_jst().strftime("%Y-%m-%d")
+    since = (now_jst() - timedelta(days=days)).strftime("%Y-%m-%d")
+    with db() as con:
+        rows = con.execute(
+            "SELECT substr(time,1,10) AS d, COUNT(*) AS n, "
+            "SUM(CASE WHEN snow_flag IS NOT NULL THEN 1 ELSE 0 END) AS nf, "
+            "SUM(CASE WHEN snow_flag=1 THEN 1 ELSE 0 END) AS sn, "
+            "COALESCE(SUM(precip),0) AS pr, MIN(temp) AS tmin, MAX(temp) AS tmax, "
+            "MAX(time) AS last, MIN(CASE WHEN snow_flag=1 THEN time END) AS first_snow, "
+            "SUM(CASE WHEN flag_src='proxy' THEN 1 ELSE 0 END) AS px, "
+            "SUM(CASE WHEN flag_src='manual' THEN 1 ELSE 0 END) AS nm "
+            "FROM obs WHERE substr(time,1,10)>=? GROUP BY d ORDER BY d", (since,)).fetchall()
+    out = []
+    for x in rows:
+        sn, nf = x["sn"] or 0, x["nf"] or 0
+        if sn > 0:
+            st = "snow"
+        elif x["d"] < today and nf >= 18:
+            st = "none"
+        else:
+            st = "pending"
+        out.append({"date": x["d"], "hours": x["n"], "flagged": nf, "snow": sn, "first_snow": x["first_snow"],
+                    "precip": r(x["pr"], 1), "tmin": r(x["tmin"], 1), "tmax": r(x["tmax"], 1), "last": x["last"],
+                    "proxy": x["px"] or 0, "manual": x["nm"] or 0, "status": st})
+    return {"today": today, "updated": now_jst().strftime("%Y-%m-%d %H:%M"), "days": out}
+
+
+@app.route("/api/daily")
+def api_daily():
+    with db() as con:
+        n = con.execute("SELECT COUNT(*) c FROM obs").fetchone()["c"]
+    if n == 0:
+        try:
+            ingest_obs()
+        except Exception as e:  # noqa
+            return jsonify({"error": str(e), "days": []}), 502
+    return jsonify(daily_results(qint("days", 60, 1, 365)))
+
+
 @app.route("/api/observe", methods=["POST"])
 def api_observe():
     """目視などの雪の有無を手動登録。{"time":"2026-12-01T09:00","snow":true}"""
@@ -1409,6 +1456,42 @@ th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .sortable{cursor:pointer;user-select:none}
 .foot{font-size:12px;color:var(--sub);padding:0 0 30px}
+/* 予想バトル */
+.cta{margin-top:12px;width:100%;text-align:left;border:1px solid var(--ice);background:rgba(159,211,255,.10);color:var(--tx);border-radius:12px;padding:11px 14px;font-size:14px;font-weight:700;cursor:pointer}
+.cta:focus-visible,.pkb:focus-visible,.st:focus-visible{outline:2px solid var(--ice);outline-offset:2px}
+.card{background:var(--bg2);border:1px solid var(--ln);border-radius:var(--r);padding:14px;margin:0 0 10px}
+.nameRow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+input.txt{background:var(--bg);border:1px solid var(--ln);color:var(--tx);border-radius:10px;padding:9px 11px;font-size:16px;min-width:0;flex:1}
+.live{display:flex;gap:12px;align-items:center}
+.live .big{font-size:38px;line-height:1}
+.live b{font-size:16px}
+.pdays{display:grid;gap:8px}
+.pd{background:var(--bg2);border:1px solid var(--ln);border-radius:14px;padding:12px}
+.pd.hot{border-color:var(--ice)}
+.pd .hd{display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap}
+.pd .ai{font-size:13px;color:var(--sub)}
+.pd .ai b{color:var(--tx)}
+.pk{display:flex;gap:8px;margin-top:10px}
+.pkb{flex:1;min-height:46px;border:1px solid var(--ln);background:var(--bg);color:var(--tx);border-radius:12px;padding:8px 6px;font-size:15px;font-weight:700;cursor:pointer}
+.pkb.on.s{background:var(--ice);color:#06223a;border-color:var(--ice)}
+.pkb.on.n{background:var(--warm);color:#3a2205;border-color:var(--warm)}
+.stars{display:flex;gap:2px;align-items:center;margin-top:8px;font-size:12px;color:var(--sub);flex-wrap:wrap}
+.st{border:0;background:transparent;font-size:24px;line-height:1;cursor:pointer;padding:4px 3px;color:var(--ln)}
+.st.on{color:#ffd45e}
+.stars span{margin-left:6px}
+.others{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px}
+.pill{font-size:12.5px;padding:3px 9px;border-radius:999px;background:var(--bg);border:1px solid var(--ln);color:var(--tx)}
+.pill.ai{border-style:dashed}
+.res .hd{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:baseline}
+.res .lb{font-weight:800}
+.res .dt{font-size:12.5px;color:var(--sub);margin:4px 0 0}
+details.ovr{margin-top:8px;font-size:13px;color:var(--sub)}
+details.ovr summary{cursor:pointer;padding:4px 0}
+details.rule{margin-top:14px;font-size:13px;color:var(--sub)}
+details.rule summary{cursor:pointer;font-weight:700;color:var(--tx)}
+details.rule ul{margin:8px 0 0;padding-left:20px}
+#fx{position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:50}
+.toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom));transform:translateX(-50%);background:var(--tx);color:#0b1424;padding:10px 16px;border-radius:999px;font-size:14px;z-index:60;max-width:90vw;text-align:center}
 </style>
 </head>
 <body>
@@ -1424,10 +1507,12 @@ th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:
 <div id="pick"></div>
 <div class="notice" id="notice"></div>
 <div class="note" id="gen">読み込み中…</div>
+<div id="cta"></div>
 </div>
 
 <nav class="tabs" role="tablist">
 <button class="tab" role="tab" data-tab="fc" aria-selected="true">予報</button>
+<button class="tab" role="tab" data-tab="game" aria-selected="false">🎯予想</button>
 <button class="tab" role="tab" data-tab="snow" aria-selected="false">積雪</button>
 <button class="tab" role="tab" data-tab="model" aria-selected="false">モデル比較</button>
 <button class="tab" role="tab" data-tab="ver" aria-selected="false">精度</button>
@@ -1440,6 +1525,15 @@ th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:
 <div class="seg" role="group"><button class="chip on" data-r="48">48時間</button><button class="chip" data-r="120">5日</button><button class="chip" data-r="264">11日</button></div>
 <div class="canvas"><canvas id="cHour"></canvas></div>
 <div class="note">棒: 降雪確率 / 薄い帯: モデル間の最小〜最大 / 線: 気温・湿球温度 / 白線と▲: 過去24時間の実況（気温・雪の判定）。凡例の「気圧」をタップで表示。</div>
+</section>
+
+<section id="s-game">
+<div class="card">
+<div class="nameRow"><label for="gName" class="note" style="margin:0">ニックネーム</label>
+<input class="txt" id="gName" maxlength="12" placeholder="例: ゆうき" autocomplete="nickname"></div>
+<div class="note" style="margin-bottom:0">名前を入れて「降る／降らない」を選ぼう。結果は甲府のアメダス実測で自動判定、Snowcast（AI）とも勝負できます。</div>
+</div>
+<div id="gameRoot"></div>
 </section>
 
 <section id="s-snow">
@@ -1486,6 +1580,8 @@ th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:
 <div class="note">見出しをタップすると並べ替えできます。CSVにはモデル別の確率も入っています。</div>
 </section>
 
+<canvas id="fx" aria-hidden="true"></canvas>
+<div id="toast" class="toast" role="status" hidden></div>
 <div class="foot">予報データ: Open-Meteo（気象庁MSM/GSM・ECMWF・NOAA・DWD・GEPS等）、実測: 気象庁アメダス。実験的な独自モデルです。防災判断は気象庁の情報を優先してください。</div>
 </div>
 
@@ -1523,6 +1619,9 @@ function drawHero(){
   document.querySelectorAll('.cell').forEach(c=>c.onclick=()=>pick(+c.dataset.i));
   const k=S.findIndex(h=>h.p>=0.3); pick(k>=0?k:0);
   $('#gen').textContent='更新 '+f.generated_at+'（JST） / 湿球しきい値 '+f.params.thr+'℃ / 確率補正: '+(Object.keys(f.calib||{}).length?'実測で学習済み':'未学習');
+  const hot=f.daily.filter(d=>d.date>jstToday()).slice(0,7).reduce((a,d)=>(!a||(d.p||0)>(a.p||0))?d:a,null);
+  $('#cta').innerHTML='<button class="cta" id="goGame">'+(hot&&(hot.p||0)>=.2?'❄️ '+dl(hot.date)+'は雪の可能性 '+pct(hot.p)+'。降るか予想して勝負！':'🎯 雪が降るか予想して遊ぶ')+' →</button>';
+  $('#goGame').onclick=()=>{setTab('game'); $('#s-game').scrollIntoView({behavior:'smooth'});};
   const bad=f.models.filter(m=>m.kind=='error').length;
   $('#notice').textContent=(f.stale?'最新の取得に失敗、または更新中のため、約'+f.age_min+'分前のデータを表示しています。':'')+
     (bad?(f.stale?' ':'')+(f.models.some(m=>m.kind=='error'&&/429|上限/.test(m.error||''))?'予報元（Open-Meteo）の1日の取得上限に達しています。日本時間9時ごろに回復します。':'取得できなかった予報モデルが'+bad+'件あります（「モデル比較」タブで理由を確認できます）。'):'');
@@ -1606,7 +1705,7 @@ async function loadObs(){
 /* ---------- タブ・操作 ---------- */
 function draw(){
   if(!FC) return;
-  if(TAB=='fc') drawFc(); else if(TAB=='snow') drawSnow(); else if(TAB=='model') drawModel(); else if(TAB=='data') drawData();
+  if(TAB=='fc') drawFc(); else if(TAB=='snow') drawSnow(); else if(TAB=='model') drawModel(); else if(TAB=='data') drawData(); else if(TAB=='game') drawGame();
   else if(TAB=='ver' && !VERLOADED){VERLOADED=true; loadVer().catch(()=>{$('#ver').textContent='検証データを取得できませんでした。しばらくしてから再度開いてください。';VERLOADED=false;}); loadObs().catch(()=>{});}
 }
 const COLS=[['time','時刻',h=>hh(h.time)],['p','降雪確率',h=>pct(h.p)],['lo','最小',h=>pct(h.lo)],['hi','最大',h=>pct(h.hi)],
@@ -1652,6 +1751,221 @@ $('#tData').addEventListener('click',e=>{const th=e.target.closest('th[data-k]')
 document.querySelectorAll('[data-dr]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-dr]').forEach(x=>x.classList.remove('on'));b.classList.add('on');DR=+b.dataset.dr;if(FC)drawData();});
 document.querySelectorAll('[data-tm]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tm]').forEach(x=>x.classList.remove('on'));b.classList.add('on');TM=b.dataset.tm;drawTrend();});
 $('#onlySnow').onchange=()=>{if(FC)drawData();};
+
+/* ---------- 予想バトル ---------- */
+const GK='snowcast_game_v1';
+let DAILY=null, G=loadG();
+function loadG(){
+  let g=null; try{g=JSON.parse(localStorage.getItem(GK)||'null');}catch(e){}
+  if(!g||typeof g!=='object') g={};
+  g.u=(typeof g.u==='string'&&/^[a-z0-9]{4,12}$/.test(g.u))?g.u:(Math.random().toString(36).slice(2,8)+Date.now().toString(36).slice(-3));
+  g.name=typeof g.name==='string'?g.name:''; g.stars=[1,2,3].includes(g.stars)?g.stars:2;
+  for(const k of ['players','preds','over','seen']) if(!g[k]||typeof g[k]!=='object') g[k]={};
+  return g;
+}
+function saveG(){ try{localStorage.setItem(GK,JSON.stringify(G));}catch(e){} }
+const jstToday=()=>new Date(Date.now()+9*36e5).toISOString().slice(0,10);
+const nowMin=()=>Math.floor(Date.now()/6e4);
+const deadMin=d=>Date.parse(d+'T00:00:00+09:00')/6e4;      // 締切 = 対象日の0:00(JST)
+const cleanName=v=>String(v||'').replace(/[\u0000-\u001f<>]/g,'').trim().slice(0,12);
+let _tt; function toast(m){const t=$('#toast'); t.textContent=m; t.hidden=false; clearTimeout(_tt); _tt=setTimeout(()=>{t.hidden=true},2800);}
+
+function snowFx(ms=4200){
+  if(matchMedia('(prefers-reduced-motion:reduce)').matches) return;
+  const c=$('#fx'), g=c.getContext('2d'); c.width=innerWidth; c.height=innerHeight;
+  const F=Array.from({length:80},()=>({x:Math.random()*c.width,y:-Math.random()*c.height,r:1.5+Math.random()*4,v:1+Math.random()*2.6,w:Math.random()*6.28}));
+  const t0=performance.now();
+  (function f(t){
+    g.clearRect(0,0,c.width,c.height); if(t-t0>ms) return;
+    g.fillStyle='rgba(255,255,255,.92)';
+    for(const s of F){s.y+=s.v;s.w+=.03;s.x+=Math.sin(s.w)*.8; if(s.y>c.height+8){s.y=-8;s.x=Math.random()*c.width;} g.beginPath();g.arc(s.x,s.y,s.r,0,6.3);g.fill();}
+    requestAnimationFrame(f);
+  })(t0);
+}
+
+/* 判定 */
+function resultOf(date){
+  if(G.over[date]) return {st:G.over[date]==='s'?'snow':'none',man:true,row:DAILY&&DAILY[date]};
+  const row=DAILY&&DAILY[date];
+  return row?{st:row.status,row}:{st:'pending'};
+}
+const pts=(p,st)=>{const hit=(p.k==1)===(st==='snow'); return {hit,pt:hit?10*p.s:-5*p.s};};
+function aiOf(d){      // AIの予想 = 最初に誰かが予想した時点の統合確率(50%以上で「降る」)
+  let b=null; for(const p of Object.values(G.preds)) if(p.d===d&&p.ai!=null&&(!b||p.t<b.t)) b=p;
+  if(!b) return null;
+  const q=b.ai/100, c=Math.max(q,1-q);
+  return {k:q>=.5?1:0,s:c>=.8?3:c>=.65?2:1,ai:b.ai};
+}
+function names(){const n={...G.players}; if(G.name) n[G.u]=G.name; return n;}
+function board(){
+  const nm=names(), stat={ai:{id:'ai',name:'🤖 Snowcast',n:0,hit:0,pt:0,seq:[]}}, h2h={w:0,l:0,d:0};
+  const dates=[...new Set(Object.values(G.preds).map(p=>p.d))].sort();
+  for(const d of dates){
+    const rs=resultOf(d); if(rs.st==='pending') continue;
+    const ai=aiOf(d); let ah=null;
+    if(ai){const o=pts(ai,rs.st),s=stat.ai; s.n++;s.hit+=o.hit;s.pt+=o.pt;s.seq.push(o.hit);ah=o.hit;}
+    for(const p of Object.values(G.preds)) if(p.d===d){
+      const o=pts(p,rs.st), s=stat[p.u]||(stat[p.u]={id:p.u,name:nm[p.u]||'？',n:0,hit:0,pt:0,seq:[]});
+      s.n++;s.hit+=o.hit;s.pt+=o.pt;s.seq.push(o.hit);
+      if(p.u===G.u&&ai){ if(o.hit&&!ah) h2h.w++; else if(!o.hit&&ah) h2h.l++; else h2h.d++; }
+    }
+  }
+  const rows=Object.values(stat).filter(s=>s.n>0).sort((a,b)=>b.pt-a.pt||(b.hit/b.n)-(a.hit/a.n));
+  rows.forEach(s=>{let k=0; for(let i=s.seq.length-1;i>=0&&s.seq[i];i--) k++; s.streak=k;});
+  return {rows,h2h};
+}
+const rankTitle=s=>{if(s.n<3) return ''; const r=s.hit/s.n; return r>=.8?'🔮 雪の預言者':r>=.6?'🌤️ 天気読み':'🌱 修行中';};
+
+/* 操作 */
+function needName(){ if(G.name) return false; toast('先にニックネームを入れてください'); $('#gName').focus(); return true; }
+function setPick(date,k){
+  if(needName()) return;
+  if(date<=jstToday()){toast('この日は締切を過ぎています'); return;}
+  const key=G.u+'|'+date, old=G.preds[key];
+  if(old&&old.k===k){ delete G.preds[key]; saveG(); drawGame(); return; }     // もう一度押すと取り消し
+  const d=FC&&FC.daily.find(x=>x.date===date);
+  G.preds[key]={u:G.u,d:date,k,s:old?old.s:G.stars,ai:old?old.ai:(d&&d.p!=null?Math.round(d.p*100):null),t:nowMin()};
+  saveG(); drawGame();
+}
+function setStars(date,s){
+  const p=G.preds[G.u+'|'+date]; if(!p||date<=jstToday()) return;
+  p.s=s; p.t=nowMin(); G.stars=s; saveG(); drawGame();
+}
+function setOver(date,v){ if(v==='auto') delete G.over[date]; else G.over[date]=v; delete G.seen[date]; saveG(); drawGame(); }
+function resetG(){
+  if(!confirm('この端末の予想データを全部消します（取り込んだ友達の分も消えます）。よろしいですか？')) return;
+  try{localStorage.removeItem(GK);}catch(e){} G=loadG(); $('#gName').value=''; drawGame(); toast('消しました');
+}
+
+/* 共有リンク */
+const b64e=o=>{let bin=''; new TextEncoder().encode(JSON.stringify(o)).forEach(x=>bin+=String.fromCharCode(x)); return btoa(bin).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');};
+const b64d=t=>{t=t.replace(/-/g,'+').replace(/_/g,'/'); while(t.length%4) t+='='; return JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(t),c=>c.charCodeAt(0))));};
+function buildPayload(all){
+  const since=new Date(Date.now()+9*36e5-30*864e5).toISOString().slice(0,10), nm=names(), by={};
+  for(const p of Object.values(G.preds)){ if(p.d<since||(!all&&p.u!==G.u)) continue; (by[p.u]=by[p.u]||[]).push(p); }
+  by[G.u]=by[G.u]||[];
+  const pl=Object.entries(by).filter(([u])=>nm[u]).map(([u,a])=>({u,n:nm[u],
+    p:a.sort((x,y)=>x.d<y.d?1:-1).slice(0,60).map(p=>[p.d.slice(2).replace(/-/g,''),p.k,p.s,p.ai,p.t])}));
+  return {v:1,pl};
+}
+async function shareLink(all){
+  if(needName()) return;
+  const url=location.origin+location.pathname+'#play='+b64e(buildPayload(all));
+  const text='SNOW CAST 雪予想バトル！'+(all?'みんなの予想':G.name+'さんの予想')+'を送ります。リンクを開くと、あなたの画面にも並びます。';
+  if(navigator.share){ try{ await navigator.share({title:'SNOW CAST 予想バトル',text,url}); return; }catch(e){ if(e&&e.name==='AbortError') return; } }
+  try{ await navigator.clipboard.writeText(text+'\n'+url); toast('リンクをコピーしました。友達に送ってね'); }
+  catch(e){ prompt('このリンクをコピーして友達に送ってください',url); }
+}
+function importFromHash(h){
+  let n=0,pn=0;
+  try{
+    const j=b64d(h.slice(5));
+    if(!j||j.v!==1||!Array.isArray(j.pl)) throw 0;
+    for(const pl of j.pl.slice(0,20)){
+      if(!pl||typeof pl.u!=='string'||!/^[a-z0-9]{4,12}$/.test(pl.u)||pl.u===G.u||!Array.isArray(pl.p)) continue;
+      const nm=cleanName(pl.n); if(!nm) continue;
+      let got=0;
+      for(const q of pl.p.slice(0,200)){
+        if(!Array.isArray(q)||!/^\d{6}$/.test(String(q[0]))) continue;
+        const ds=String(q[0]), d='20'+ds.slice(0,2)+'-'+ds.slice(2,4)+'-'+ds.slice(4,6), k=q[1], s=q[2], ai=q[3], t=q[4];
+        if(!(k===0||k===1)||![1,2,3].includes(s)||!(ai===null||(Number.isInteger(ai)&&ai>=0&&ai<=100))||!Number.isInteger(t)) continue;
+        if(isNaN(Date.parse(d+'T00:00:00+09:00'))||t>=deadMin(d)) continue;      // 締切後に作られた予想は無効
+        const key=pl.u+'|'+d, old=G.preds[key];
+        if(!old||old.t<t){ G.preds[key]={u:pl.u,d,k,s,ai,t}; got++; }
+      }
+      if(got>0||G.players[pl.u]){ G.players[pl.u]=nm; pn++; n+=got; }
+    }
+    saveG();
+    toast(pn?(n>0?pn+'人の予想を取り込みました（新着 '+n+'件）':'すでに取り込み済みです'):'有効な予想が見つかりませんでした');
+  }catch(e){ toast('リンクを読み取れませんでした'); }
+}
+
+/* 描画 */
+function liveHtml(){
+  if(!DAILY) return '<div class="note" style="margin:0">実況を読み込み中…</div>';
+  const t=jstToday(), row=DAILY[t];
+  if(!row) return '<div class="note" style="margin:0">今日の実況データがまだありません。</div>';
+  const snow=row.snow>0, wet=row.precip>0, ic=snow?'❄️':wet?'🌧️':'☀️';
+  const msg=snow?'雪の判定が出ています（'+row.snow+'時間）':wet?'雪ではなく雨（降水 '+row.precip+'mm）':'いまのところ雪も雨もなし';
+  return `<div class="live"><div class="big">${ic}</div><div><b>${msg}</b><div class="note" style="margin:2px 0 0">${dl(t)} ${row.last?(+row.last.slice(11,13))+'時までの甲府の実測':''}　気温 ${row.tmin??'-'}〜${row.tmax??'-'}℃</div></div></div>`;
+}
+const pill=(name,p,ai,st)=>{
+  let t=esc(name)+' '+(p.k?'❄️':'☀️')+(ai?('（雪'+p.ai+'%）'):'★'.repeat(p.s));
+  if(st&&st!=='pending'){const o=pts(p,st); t+=' '+(o.hit?'✅':'❌')+' '+(o.pt>0?'+':'')+o.pt;}
+  return `<span class="pill${ai?' ai':''}">${t}</span>`;
+};
+function rowHtml(d){
+  const mine=G.preds[G.u+'|'+d.date], nm=names();
+  const others=Object.values(G.preds).filter(p=>p.d===d.date&&p.u!==G.u);
+  const on=k=>!!(mine&&mine.k===k);
+  return `<div class="pd${(d.p||0)>=.3?' hot':''}"><div class="hd"><b>${dl(d.date)}</b>
+    <span class="ai">🤖 Snowcast <b>${pct(d.p)}</b> ${ico(d.p||0)} ${d.tmin!=null?Math.round(d.tmin)+'〜'+Math.round(d.tmax)+'℃':''}</span></div>
+    <div class="pk"><button class="pkb s${on(1)?' on':''}" data-act="pick" data-d="${d.date}" data-k="1" aria-pressed="${on(1)}">❄️ 降る</button>
+    <button class="pkb n${on(0)?' on':''}" data-act="pick" data-d="${d.date}" data-k="0" aria-pressed="${on(0)}">☀️ 降らない</button></div>
+    ${mine?`<div class="stars">自信 ${[1,2,3].map(n=>`<button class="st${n<=mine.s?' on':''}" data-act="star" data-d="${d.date}" data-s="${n}" aria-label="自信 星${n}">★</button>`).join('')}<span>${['','弱気','ふつう','強気'][mine.s]}：当たり +${10*mine.s}pt / ハズレ −${5*mine.s}pt</span></div>`:''}
+    ${others.length?`<div class="others">${others.map(p=>pill(nm[p.u]||'？',p)).join('')}</div>`:''}</div>`;
+}
+function resultsHtml(){
+  const today=jstToday(), nm=names();
+  const ds=[...new Set(Object.values(G.preds).map(p=>p.d))].filter(d=>d<=today).sort().reverse().slice(0,12);
+  if(!ds.length) return '<div class="note">まだ結果の出た予想はありません。明日以降の予想を選ぶと、その日の夜に結果が出ます。</div>';
+  return ds.map(d=>{
+    const rs=resultOf(d), row=rs.row, ai=aiOf(d);
+    const lb=rs.st==='snow'?'❄️ 雪が降りました':rs.st==='none'?(row&&row.precip>0?'🌧️ 雪は降らず（雨）':'☀️ 雪は降りませんでした'):'⏳ 判定待ち';
+    const dt=row?`実測 ${row.hours}時間分 ／ 雪判定 ${row.snow}時間${row.first_snow?'（最初 '+(+row.first_snow.slice(11,13))+'時）':''} ／ 気温 ${row.tmin??'-'}〜${row.tmax??'-'}℃ ／ 降水 ${row.precip??0}mm${row.proxy>0&&row.manual==0?' ／ 簡易判定':''}`:'実測データがありません';
+    const ps=Object.values(G.preds).filter(p=>p.d===d).sort((a,b)=>a.t-b.t);
+    return `<div class="card res"><div class="hd"><b>${dl(d)}</b><span class="lb">${lb}${rs.man?'（目視で判定）':''}</span></div>
+      <div class="dt">${dt}</div>
+      <div class="others">${ai?pill('🤖 Snowcast',ai,true,rs.st):''}${ps.map(p=>pill(p.u===G.u?(G.name||'あなた'):(nm[p.u]||'？'),p,false,rs.st)).join('')}</div>
+      <details class="ovr"><summary>判定を直す（目視）</summary><div class="seg" style="margin:6px 0 0"><button class="chip" data-act="over" data-d="${d}" data-v="s">降った</button><button class="chip" data-act="over" data-d="${d}" data-v="n">降らなかった</button><button class="chip" data-act="over" data-d="${d}" data-v="auto">自動に戻す</button></div>
+      <div class="note">この端末の表示だけが変わります。雨雪の境目で自動判定と実感がずれたときにどうぞ。</div></details></div>`;
+  }).join('');
+}
+function boardHtml(){
+  const b=board();
+  if(!b.rows.length) return '<div class="note">結果の出た予想がまだないので、ランキングは判定が出てから表示されます。</div>';
+  let h='';
+  const g=b.h2h; if(g.w+g.l+g.d>0) h+=`<div class="card">🆚 <b>あなた vs Snowcast</b>　${g.w}勝 ${g.l}敗 ${g.d}分<div class="note" style="margin:2px 0 0">どちらか一方だけ当てた日が勝ち負けです。</div></div>`;
+  h+='<div class="scroll"><table><tr><th>順位</th><th>名前</th><th>pt</th><th>的中</th><th>連勝</th></tr>'+
+    b.rows.map((s,i)=>`<tr><td>${i+1}</td><td>${esc(s.name)}${s.id===G.u?'<span class="tag">あなた</span>':''}${rankTitle(s)?'<span class="tag">'+rankTitle(s)+'</span>':''}</td><td><b>${s.pt}</b></td><td>${s.hit}/${s.n}（${Math.round(s.hit/s.n*100)}%）</td><td>${s.streak>=2?'🔥':''}${s.streak}</td></tr>`).join('')+'</table></div>';
+  return h;
+}
+function drawGame(){
+  const root=$('#gameRoot'); if(!root) return;
+  const today=jstToday(), up=(FC?FC.daily:[]).filter(d=>d.date>today).slice(0,7);
+  root.innerHTML='<h2>今日の実況</h2><div class="card">'+liveHtml()+'</div>'+
+    '<h2>予想する（締切は前日の24時）</h2>'+(FC?'<div class="pdays">'+up.map(rowHtml).join('')+'</div>':'<div class="skel"></div>')+
+    '<div class="note">もう一度押すと取り消せます。他の人の予想は、リンクを取り込むとここに並びます。</div>'+
+    '<h2>結果発表</h2>'+resultsHtml()+
+    '<h2>ランキング</h2>'+boardHtml()+
+    '<h2>友達と遊ぶ</h2><div class="card"><div class="note" style="margin-top:0">リンクを友達に送ると、あなたの予想が友達の画面に並びます。友達のリンクを開くと、その人の予想があなたの画面に入ります。予想はこの端末のブラウザに保存され、リンクで送らない限り誰にも見られません。</div>'+
+    '<div class="row"><button class="iconbtn" data-act="share" data-all="0">自分の予想を送る</button><button class="iconbtn" data-act="share" data-all="1">みんなの分をまとめて送る</button><button class="iconbtn" data-act="reset">データを消す</button></div></div>'+
+    '<details class="rule"><summary>ルール</summary><ul>'+
+    '<li>対象は甲府のアメダス。その日（0〜23時）に雪の判定が1時間でも出れば「降った」です。</li>'+
+    '<li>雪の判定は、積雪計が無い場合は「降水があり気温0.5℃以下」の簡易判定です。ずれたら「判定を直す」で目視判定にできます。</li>'+
+    '<li>予想は前日24時まで。自信（★1〜3）が高いほど、当たれば +10pt×★、外せば −5pt×★。</li>'+
+    '<li>🤖 Snowcast は、最初に予想が入った時点の統合降雪確率が50%以上なら「降る」。確率の偏りが大きいほど自信が高い扱いです。</li>'+
+    '<li>雪の判定が出た日は、その時点で結果が確定します。雪なしは日が終わってから確定します。</li></ul></details>';
+  const fresh=[...new Set(Object.values(G.preds).map(p=>p.d))].filter(d=>d<=today&&!G.seen[d]&&resultOf(d).st==='snow');
+  if(fresh.length){ fresh.forEach(d=>G.seen[d]=1); saveG(); snowFx(); }
+}
+async function loadDaily(){
+  const j=await fetch('/api/daily?days=60').then(r=>r.json());
+  DAILY=Object.fromEntries((j.days||[]).map(x=>[x.date,x]));
+  if(TAB=='game') drawGame();
+}
+$('#gameRoot').addEventListener('click',e=>{
+  const b=e.target.closest('[data-act]'); if(!b) return;
+  const a=b.dataset.act, d=b.dataset.d;
+  if(a==='pick') setPick(d,+b.dataset.k); else if(a==='star') setStars(d,+b.dataset.s);
+  else if(a==='over') setOver(d,b.dataset.v); else if(a==='share') shareLink(b.dataset.all==='1'); else if(a==='reset') resetG();
+});
+addEventListener('hashchange',()=>{const h=location.hash.slice(1); if(h.startsWith('play=')){importFromHash(h); setTab('game');}});
+$('#gName').value=G.name;
+$('#gName').addEventListener('change',e=>{
+  const v=cleanName(e.target.value); e.target.value=v; if(!v) return;
+  G.name=v; saveG(); toast('「'+v+'」で参加中'); drawGame();
+});
 
 function setTab(t){
   TAB=t;
@@ -1703,11 +2017,14 @@ $('#btnTrain').onclick=async()=>{
 };
 
 (async()=>{
-  const h=location.hash.slice(1); if(['fc','snow','model','ver','data'].includes(h)) TAB=h;
+  const h=location.hash.slice(1);
+  if(h.startsWith('play=')){ importFromHash(h); TAB='game'; }
+  else if(['fc','game','snow','model','ver','data'].includes(h)) TAB=h;
+  loadDaily().catch(()=>{});
   await loadForecast(false);
   setTab(TAB);
   loadObs().then(()=>{if(TAB=='fc'&&FC)drawHour();}).catch(()=>{});
-  setInterval(()=>loadForecast(false), 30*60*1000);
+  setInterval(()=>{loadForecast(false); loadDaily().catch(()=>{});}, 30*60*1000);
 })();
 </script>
 </body></html>
