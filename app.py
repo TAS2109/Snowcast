@@ -1251,6 +1251,30 @@ def api_forecast():
         return jsonify({"error": str(e)}), 502
 
 
+def forecast_trend(max_days=5, n_issues=40):
+    """「予報は時間とともにどう変わってきたか」。対象日ごとに、過去の各発表時点での最大降雪確率と降雪量を返す。
+    その日の大部分(18時間以上)が予報対象になっている発表だけを使う。"""
+    base = now_jst().replace(hour=0, minute=0, second=0, microsecond=0)
+    dates = [(base + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(max_days)]
+    since = tstr(hour_floor() - timedelta(hours=SNAPSHOT_INTERVAL_H * n_issues))
+    q = ",".join("?" * len(dates))
+    with db() as con:
+        rows = con.execute(
+            "SELECT issue, substr(target,1,10) d, MAX(p) pmax, SUM(cm) cm, COUNT(*) n FROM final_snap "
+            "WHERE issue>=? AND substr(target,1,10) IN (%s) GROUP BY issue, d HAVING n>=18 ORDER BY issue" % q,
+            [since] + dates).fetchall()
+    days = {d: [] for d in dates}
+    for row in rows:
+        days[row["d"]].append({"issue": row["issue"], "p": None if row["pmax"] is None else round(row["pmax"], 3),
+                               "cm": None if row["cm"] is None else round(row["cm"], 1)})
+    return {"issues": sorted({row["issue"] for row in rows}), "days": days}
+
+
+@app.route("/api/trend")
+def api_trend():
+    return jsonify(forecast_trend())
+
+
 @app.route("/api/observations")
 def api_observations():
     hours = qint("hours", 48, 1, 720)
@@ -1383,6 +1407,7 @@ th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:
 @keyframes sk{to{background-position:-200% 0}}
 @media (prefers-reduced-motion:reduce){.skel{animation:none}.cell{transition:none}}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.sortable{cursor:pointer;user-select:none}
 .foot{font-size:12px;color:var(--sub);padding:0 0 30px}
 </style>
 </head>
@@ -1406,6 +1431,7 @@ th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:
 <button class="tab" role="tab" data-tab="snow" aria-selected="false">積雪</button>
 <button class="tab" role="tab" data-tab="model" aria-selected="false">モデル比較</button>
 <button class="tab" role="tab" data-tab="ver" aria-selected="false">精度</button>
+<button class="tab" role="tab" data-tab="data" aria-selected="false">データ</button>
 </nav>
 
 <section id="s-fc" class="on">
@@ -1413,7 +1439,7 @@ th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:
 <h2>1時間ごとの降雪確率</h2>
 <div class="seg" role="group"><button class="chip on" data-r="48">48時間</button><button class="chip" data-r="120">5日</button><button class="chip" data-r="264">11日</button></div>
 <div class="canvas"><canvas id="cHour"></canvas></div>
-<div class="note">棒: 降雪確率 / 薄い帯: モデル間の最小〜最大 / 線: 気温・湿球温度。凡例の「気圧」をタップで表示。</div>
+<div class="note">棒: 降雪確率 / 薄い帯: モデル間の最小〜最大 / 線: 気温・湿球温度 / 白線と▲: 過去24時間の実況（気温・雪の判定）。凡例の「気圧」をタップで表示。</div>
 </section>
 
 <section id="s-snow">
@@ -1444,6 +1470,22 @@ th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:
 <div class="scroll"><table id="tObs"></table></div>
 </section>
 
+<section id="s-data">
+<h2>予報の推移（いつから、どう変わってきたか）</h2>
+<div class="seg" role="group"><button class="chip on" data-tm="p">最大降雪確率</button><button class="chip" data-tm="cm">日降雪量</button></div>
+<div class="canvas"><canvas id="cTrend"></canvas></div>
+<div class="note" id="trendNote">横軸は予報を出した時刻、線は対象の日です。右に向かって線が安定していれば予報が固まっています。大きく上下するときは不確実です。</div>
+<h2>時間別データ</h2>
+<div class="row" style="margin-bottom:8px">
+<div class="seg" role="group"><button class="chip on" data-dr="48">48時間</button><button class="chip" data-dr="120">5日</button><button class="chip" data-dr="999">全て</button></div>
+<label class="note" style="margin:0"><input type="checkbox" id="onlySnow"> 雪の可能性10%以上だけ</label>
+<button class="iconbtn" id="csvH">CSV（時間別）</button><button class="iconbtn" id="csvD">CSV（日別）</button>
+</div>
+<div class="note" id="dCount"></div>
+<div class="scroll"><table id="tData"></table></div>
+<div class="note">見出しをタップすると並べ替えできます。CSVにはモデル別の確率も入っています。</div>
+</section>
+
 <div class="foot">予報データ: Open-Meteo（気象庁MSM/GSM・ECMWF・NOAA・DWD・GEPS等）、実測: 気象庁アメダス。実験的な独自モデルです。防災判断は気象庁の情報を優先してください。</div>
 </div>
 
@@ -1458,7 +1500,7 @@ const dl=d=>{const x=new Date(d+'T00:00:00');return (x.getMonth()+1)+'/'+x.getDa
 const heat=p=>`rgba(159,211,255,${(0.10+0.85*p).toFixed(2)})`;
 const ico=p=>p>=.6?'❄️':p>=.3?'🌨️':p>=.1?'🌥️':'';
 const word=p=>p>=.6?'雪の可能性が高い':p>=.3?'雪になりそう':p>=.1?'わずかに可能性':'雪なし';
-let FC=null, RANGE=48, TAB='fc', VERLOADED=false;
+let FC=null, OBS=[], TREND=null, RANGE=48, TAB='fc', VERLOADED=false, TM='p', DR=48, SORT={k:'time',d:1};
 (()=>{const s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js';
   s.onload=()=>{Chart.defaults.color=TICK;Chart.defaults.font.family='inherit';draw();};document.head.appendChild(s);})();
 
@@ -1487,18 +1529,27 @@ function drawHero(){
 }
 
 /* ---------- 各タブ ---------- */
+const nowLine={id:'nowLine',afterDatasetsDraw(c,_a,o){
+  if(o.i==null) return;
+  const x=c.scales.x.getPixelForValue(o.i-0.5), a=c.chartArea, g=c.ctx;
+  g.save();g.strokeStyle='rgba(255,255,255,.5)';g.setLineDash([4,3]);g.beginPath();g.moveTo(x,a.top);g.lineTo(x,a.bottom);g.stroke();
+  g.setLineDash([]);g.fillStyle='rgba(255,255,255,.75)';g.font='11px sans-serif';g.fillText('いま',x+4,a.top+12);g.restore();}};
 function drawHour(){
   const H=FC.hourly.filter(h=>h.p!=null).slice(0,RANGE);
-  mk('#cHour',{data:{labels:H.map(h=>hh(h.time)),datasets:[
-    {type:'bar',label:'降雪確率(%)',data:H.map(h=>h.p*100),backgroundColor:H.map(h=>heat(h.p)),yAxisID:'y',order:3},
-    {type:'line',label:'最大モデル',data:H.map(h=>h.hi*100),borderColor:'rgba(255,255,255,.2)',pointRadius:0,borderWidth:1,yAxisID:'y',order:2},
-    {type:'line',label:'最小モデル',data:H.map(h=>h.lo*100),borderColor:'rgba(255,255,255,.2)',pointRadius:0,borderWidth:1,yAxisID:'y',fill:'-1',backgroundColor:'rgba(255,255,255,.06)',order:2},
-    {type:'line',label:'気温(℃)',data:H.map(h=>h.temp),borderColor:COLORS[1],pointRadius:0,borderWidth:2,yAxisID:'y2',order:1},
-    {type:'line',label:'湿球温度(℃)',data:H.map(h=>h.tw),borderColor:COLORS[2],pointRadius:0,borderWidth:2,borderDash:[4,3],yAxisID:'y2',order:1},
-    {type:'line',label:'気圧(hPa)',data:H.map(h=>h.pres),borderColor:COLORS[4],pointRadius:0,borderWidth:1.5,yAxisID:'y3',hidden:true,order:1}]},
+  const past=(OBS||[]).filter(r=>r.time<H[0].time).slice(-24), np=past.length;
+  const pad=a=>Array(np).fill(null).concat(a), tail=Array(H.length).fill(null);
+  mk('#cHour',{plugins:[nowLine],data:{labels:past.map(r=>hh(r.time)).concat(H.map(h=>hh(h.time))),datasets:[
+    {type:'bar',label:'降雪確率(%)',data:pad(H.map(h=>h.p*100)),backgroundColor:pad(H.map(h=>heat(h.p))),yAxisID:'y',order:3},
+    {type:'line',label:'最大モデル',data:pad(H.map(h=>h.hi*100)),borderColor:'rgba(255,255,255,.2)',pointRadius:0,borderWidth:1,yAxisID:'y',order:2},
+    {type:'line',label:'最小モデル',data:pad(H.map(h=>h.lo*100)),borderColor:'rgba(255,255,255,.2)',pointRadius:0,borderWidth:1,yAxisID:'y',fill:'-1',backgroundColor:'rgba(255,255,255,.06)',order:2},
+    {type:'line',label:'気温(℃)',data:pad(H.map(h=>h.temp)),borderColor:COLORS[1],pointRadius:0,borderWidth:2,yAxisID:'y2',order:1},
+    {type:'line',label:'湿球温度(℃)',data:pad(H.map(h=>h.tw)),borderColor:COLORS[2],pointRadius:0,borderWidth:2,borderDash:[4,3],yAxisID:'y2',order:1},
+    {type:'line',label:'実況の気温(℃)',data:past.map(r=>r.temp).concat(tail),borderColor:'#fff',pointRadius:0,borderWidth:2,yAxisID:'y2',order:1},
+    {type:'line',label:'実況: 雪あり',data:past.map(r=>r.snow_flag?100:null).concat(tail),showLine:false,pointStyle:'triangle',pointRadius:6,borderColor:'#fff',backgroundColor:'#fff',yAxisID:'y',order:0},
+    {type:'line',label:'気圧(hPa)',data:pad(H.map(h=>h.pres)),borderColor:COLORS[4],pointRadius:0,borderWidth:1.5,yAxisID:'y3',hidden:true,order:1}]},
     options:{maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
       scales:{y:{min:0,max:100,grid:{color:GRID},ticks:{callback:v=>v+'%'}},y2:{position:'right',grid:{display:false},ticks:{callback:v=>v+'℃'}},y3:{position:'right',display:'auto',grid:{display:false}},x:{grid:{display:false},ticks:{maxTicksLimit:6}}},
-      plugins:{legend:{labels:{boxWidth:10,usePointStyle:true}}}}});
+      plugins:{legend:{labels:{boxWidth:10,usePointStyle:true}},nowLine:{i:np?np:null}}}});
 }
 function drawFc(){
   const D=FC.daily;
@@ -1547,7 +1598,7 @@ async function loadVer(){
 }
 async function loadObs(){
   const o=await fetch('/api/observations?hours=36').then(r=>r.json());
-  const R=(o.rows||[]).slice(-24).reverse();
+  OBS=o.rows||[]; const R=OBS.slice(-24).reverse();
   $('#tObs').innerHTML='<tr><th>時刻</th><th>気温</th><th>湿度</th><th>降水1h</th><th>積雪深</th><th>雪判定</th></tr>'+
    R.map(x=>`<tr><td>${hh(x.time)}</td><td>${x.temp??'-'}</td><td>${x.rh??'-'}</td><td>${x.precip??'-'}</td><td>${x.snow_depth??'-'}</td><td>${x.snow_flag==null?'-':(x.snow_flag?'雪':'なし')}<span class="tag">${x.flag_src||''}</span></td></tr>`).join('');
 }
@@ -1555,9 +1606,53 @@ async function loadObs(){
 /* ---------- タブ・操作 ---------- */
 function draw(){
   if(!FC) return;
-  if(TAB=='fc') drawFc(); else if(TAB=='snow') drawSnow(); else if(TAB=='model') drawModel();
+  if(TAB=='fc') drawFc(); else if(TAB=='snow') drawSnow(); else if(TAB=='model') drawModel(); else if(TAB=='data') drawData();
   else if(TAB=='ver' && !VERLOADED){VERLOADED=true; loadVer().catch(()=>{$('#ver').textContent='検証データを取得できませんでした。しばらくしてから再度開いてください。';VERLOADED=false;}); loadObs().catch(()=>{});}
 }
+const COLS=[['time','時刻',h=>hh(h.time)],['p','降雪確率',h=>pct(h.p)],['lo','最小',h=>pct(h.lo)],['hi','最大',h=>pct(h.hi)],
+  ['agree','一致度',h=>h.agree??'-'],['temp','気温℃',h=>h.temp??'-'],['tw','湿球℃',h=>h.tw??'-'],['precip','降水mm',h=>h.precip??'-'],
+  ['cm','降雪cm',h=>h.cm??'-'],['depth','積雪cm',h=>h.depth??'-'],['pres','気圧hPa',h=>h.pres??'-']];
+function dataRows(){
+  let R=FC.hourly.filter(h=>h.p!=null);
+  if(DR<999) R=R.slice(0,DR);
+  if($('#onlySnow').checked) R=R.filter(h=>h.p>=0.1);
+  const k=SORT.k, v=h=>h[k]==null?-1e9:h[k];
+  return [...R].sort((a,b)=>(v(a)<v(b)?-1:v(a)>v(b)?1:0)*SORT.d);
+}
+function drawData(){
+  const R=dataRows();
+  $('#dCount').textContent=R.length+'件';
+  $('#tData').innerHTML='<tr>'+COLS.map(c=>`<th class="sortable" data-k="${c[0]}">${c[1]}${SORT.k==c[0]?(SORT.d>0?' ▲':' ▼'):''}</th>`).join('')+'</tr>'+
+    R.map(h=>'<tr>'+COLS.map((c,i)=>i==1?`<td style="background:${heat(h.p)}">${c[2](h)}</td>`:`<td>${c[2](h)}</td>`).join('')+'</tr>').join('');
+  loadTrend().then(drawTrend).catch(()=>{$('#trendNote').textContent='予報の推移を取得できませんでした。';});
+}
+async function loadTrend(){ if(!TREND) TREND=await fetch('/api/trend').then(r=>r.json()); }
+function drawTrend(){
+  const T=TREND; if(!T||!T.issues.length){ $('#trendNote').textContent='予報の記録がまだ少ないため、数日たつと表示されます（6時間ごとに記録）。'; return; }
+  const ds=Object.entries(T.days).filter(([,v])=>v.length).map(([d,v],i)=>{const m=Object.fromEntries(v.map(x=>[x.issue,TM=='p'&&x.p!=null?x.p*100:x.cm]));
+    return {label:dl(d),data:T.issues.map(t=>m[t]??null),borderColor:COLORS[i%8],backgroundColor:COLORS[i%8],pointRadius:2,borderWidth:2,spanGaps:true,tension:.2};});
+  mk('#cTrend',{type:'line',data:{labels:T.issues.map(hh),datasets:ds},options:{maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
+    scales:{y:TM=='p'?{min:0,max:100,grid:{color:GRID},ticks:{callback:v=>v+'%'}}:{beginAtZero:true,grid:{color:GRID},ticks:{callback:v=>v+'cm'}},x:{grid:{display:false},ticks:{maxTicksLimit:6}}},
+    plugins:{legend:{labels:{boxWidth:10,usePointStyle:true}}}}});
+}
+function saveCsv(name,head,rows){
+  const q=v=>{v=v==null?'':String(v);return /[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v};
+  const blob=new Blob(['\ufeff'+[head].concat(rows).map(r=>r.map(q).join(',')).join('\r\n')],{type:'text/csv;charset=utf-8'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+}
+const MK=()=>FC.models.filter(m=>m.kind!='error');
+$('#csvH').onclick=()=>{ if(!FC) return; const M=MK(), stamp=FC.generated_at.replace(/[^0-9]/g,'').slice(0,12);
+  saveCsv('snowcast_hourly_'+stamp+'.csv',['time','p','lo','hi','agree','temp','tw','precip','cm','depth','pres'].concat(M.map(m=>'p_'+m.key)),
+    FC.hourly.filter(h=>h.p!=null).map(h=>[h.time,h.p,h.lo,h.hi,h.agree,h.temp,h.tw,h.precip,h.cm,h.depth,h.pres].concat(M.map(m=>h.by[m.key])))); };
+$('#csvD').onclick=()=>{ if(!FC) return; const M=MK(), stamp=FC.generated_at.replace(/[^0-9]/g,'').slice(0,12);
+  saveCsv('snowcast_daily_'+stamp+'.csv',['date','p','pmax_hour','cm','depth_max','p_depth1','p_depth5','p_depth10','tmin','tmax','agree'].concat(M.map(m=>'p_'+m.key)),
+    FC.daily.map(d=>[d.date,d.p,d.pmax_hour,d.cm,d.dmax,d.d1,d.d5,d.d10,d.tmin,d.tmax,d.agree].concat(M.map(m=>d.by[m.key])))); };
+$('#tData').addEventListener('click',e=>{const th=e.target.closest('th[data-k]'); if(!th||!FC) return;
+  SORT=SORT.k==th.dataset.k?{k:SORT.k,d:-SORT.d}:{k:th.dataset.k,d:1}; drawData();});
+document.querySelectorAll('[data-dr]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-dr]').forEach(x=>x.classList.remove('on'));b.classList.add('on');DR=+b.dataset.dr;if(FC)drawData();});
+document.querySelectorAll('[data-tm]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tm]').forEach(x=>x.classList.remove('on'));b.classList.add('on');TM=b.dataset.tm;drawTrend();});
+$('#onlySnow').onchange=()=>{if(FC)drawData();};
+
 function setTab(t){
   TAB=t;
   document.querySelectorAll('.tab').forEach(b=>b.setAttribute('aria-selected',b.dataset.tab==t));
@@ -1608,9 +1703,10 @@ $('#btnTrain').onclick=async()=>{
 };
 
 (async()=>{
-  const h=location.hash.slice(1); if(['fc','snow','model','ver'].includes(h)) TAB=h;
+  const h=location.hash.slice(1); if(['fc','snow','model','ver','data'].includes(h)) TAB=h;
   await loadForecast(false);
   setTab(TAB);
+  loadObs().then(()=>{if(TAB=='fc'&&FC)drawHour();}).catch(()=>{});
   setInterval(()=>loadForecast(false), 30*60*1000);
 })();
 </script>
