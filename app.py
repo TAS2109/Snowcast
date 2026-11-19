@@ -8,7 +8,7 @@ SNOW CAST  -  複数予報モデル統合による降雪確率サイト (Python 
   - 予報モデル : Open-Meteo API 経由で 気象庁MSM・GSM / ECMWF / NOAA GFS / DWD ICON
   - アンサンブル: GEPS(gem_global) / ECMWF-ENS / GEFS（全メンバーを個別に雪判別）
   - 実測       : 気象庁 アメダス 甲府(49142) ＋ 周辺アメダス（雪の観測・積雪深・風・日照）
-  - 追加の予報元: UKMO / Météo-France / カナダGDPS / CMA / KMA、MET Norway（Open-Meteoを経由しない独立系）
+  - 追加の予報元: UKMO / Météo-France / カナダGDPS / CMA、MET Norway（Open-Meteoを経由しない独立系）
   - 追加アンサンブル: ICON-EPS / ECMWF AIFS-ENS / MOGREPS-G
   - 公式       : 気象庁 府県予報（天気・降水確率・気温・週間）と警報・注意報（大雪・風雪・なだれ・着雪など）
   - 追加の要素 : 風速・雲量・モデル降雪量・0℃高度（確定論モデルのみ。表示用で、雪判別の計算には使わない）
@@ -87,7 +87,7 @@ DET_MODELS = [
     ("meteofrance_seamless", "仏 ARPEGE"),
     ("gem_seamless", "カナダ GDPS"),
     ("cma_grapes_global", "中国 CMA"),
-    ("kma_seamless", "韓国 KMA"),
+    # 韓国 KMA (kma_seamless) は甲府では全期間 null が返るため除外
     ("metno", "MET Norway"),          # Open-Meteoを経由しない独立系（fetch_metno）
 ]
 ENS_MODELS = [
@@ -99,7 +99,7 @@ ENS_MODELS = [
     ("ukmo_global_ensemble_20km", "MOGREPS-G (UKMO)"),
 ]
 # 実績がまだ無い新モデルの初期重み（検証データが溜まると再学習で置き換わる）
-DEFAULT_W = {"cma_grapes_global": 0.6, "kma_seamless": 0.6, "gem_seamless": 0.8, "metno": 0.8,
+DEFAULT_W = {"cma_grapes_global": 0.6, "gem_seamless": 0.8, "metno": 0.8,
              "meteofrance_seamless": 0.8, "ukmo_seamless": 0.9, "ens_icon_seamless": 0.9,
              "ens_ecmwf_aifs025": 0.8, "ens_ukmo_global_ensemble_20km": 0.8}
 VARIANTS_ON = os.environ.get("SNOWCAST_VARIANTS", "1") != "0"   # 0 で計算パターンの生成を止める（軽くしたいとき）
