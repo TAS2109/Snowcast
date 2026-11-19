@@ -1,0 +1,66 @@
+name: snowcast
+
+on:
+  schedule:
+    - cron: "17 * * * *"      # 毎時17分（予報元の更新は1日4回程度なので1時間おきで十分）
+  workflow_dispatch: {}       # 手動実行ボタン
+  push:
+    branches: [main]
+    paths: ["app.py", "build_static.py", ".github/workflows/snowcast.yml"]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: snowcast
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install flask
+
+      - name: 前回のDBを取得（専用ブランチ snowcast-data）
+        run: |
+          if git fetch --depth=1 origin snowcast-data 2>/dev/null; then
+            git show FETCH_HEAD:snowcast.sqlite.gz > snowcast.sqlite.gz
+            ls -l snowcast.sqlite.gz
+          else
+            echo "初回実行: DBなし"
+          fi
+
+      - name: 予報を計算してサイトを生成
+        run: python build_static.py
+
+      - name: DBを専用ブランチへ保存（履歴を残さず上書き）
+        env:
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ github.token }}
+        run: |
+          mkdir _data && cp snowcast.sqlite.gz _data/ && cd _data
+          git init -q -b tmp
+          git add .
+          git -c user.name=snowcast-bot -c user.email=bot@users.noreply.github.com commit -qm "db $(date -u +%FT%TZ)"
+          git push -f "https://x-access-token:${TOKEN}@github.com/${REPO}.git" tmp:snowcast-data
+        # ※ここを書き込めるようにするため、Settings > Actions > General > Workflow permissions を
+        #   「Read and write permissions」にしておく
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
