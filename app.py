@@ -145,6 +145,16 @@ def http_get(url, params=None, timeout=25, retries=2):
             req = urlrequest.Request(url, headers={"User-Agent": "SNOWCAST/1.0"})
             with urlrequest.urlopen(req, timeout=timeout) as r:
                 return r.read().decode("utf-8")
+        except urlerror.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", "replace")
+                reason = json.loads(body).get("reason") or body
+            except Exception:  # noqa
+                reason = e.reason
+            last = RuntimeError("HTTP %s: %s" % (e.code, str(reason)[:160]))
+            if 400 <= e.code < 500 and e.code != 429:
+                break                       # 入力不正は再試行しても同じ
+            time.sleep((3.0 if e.code == 429 else 0.8) * (k + 1))
         except Exception as e:  # noqa
             last = e
             time.sleep(0.8 * (k + 1))
@@ -504,9 +514,12 @@ def _base_params():
 def fetch_det(model):
     url = "https://api.open-meteo.com/v1/forecast"
     last = None
-    for vars_ in (DET_VARS_FULL, DET_VARS_CORE):
+    for vars_, minimal in ((DET_VARS_FULL, False), (DET_VARS_CORE, False), (DET_VARS_CORE, True)):
         try:
             p = _base_params()
+            if minimal:
+                p.pop("elevation", None)
+                p["forecast_days"] = 7
             p.update({"models": model, "hourly": ",".join(vars_)})
             js = http_json(url, p)
             h = js["hourly"]
@@ -570,7 +583,7 @@ def fetch_all():
             try:
                 (det if kind == "det" else ens)[key] = fut.result()
             except Exception as e:  # noqa
-                errors[("ens_" if kind == "ens" else "") + key] = str(e)[:120]
+                errors[("ens_" if kind == "ens" else "") + key] = str(e)[:200]
                 log.warning("fetch %s %s failed: %s", kind, key, e)
     return det, ens, errors
 
@@ -1374,6 +1387,7 @@ th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:
 const $=s=>document.querySelector(s);
 const WD='日月火水木金土', charts={}, GRID='rgba(255,255,255,.07)', TICK='#8ea3c0';
 const COLORS=['#9fd3ff','#ffc27a','#7be0a1','#ff8fa8','#c9a6ff','#f5e663','#7fdbda','#ff9f6b'];
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const pct=p=>p==null?'-':Math.round(p*100)+'%';
 const hh=t=>t.slice(5,10).replace('-','/')+' '+t.slice(11,13)+'時';
 const dl=d=>{const x=new Date(d+'T00:00:00');return (x.getMonth()+1)+'/'+x.getDate()+'('+WD[x.getDay()]+')'};
@@ -1402,7 +1416,9 @@ function drawHero(){
   document.querySelectorAll('.cell').forEach(c=>c.onclick=()=>pick(+c.dataset.i));
   const k=S.findIndex(h=>h.p>=0.3); pick(k>=0?k:0);
   $('#gen').textContent='更新 '+f.generated_at+'（JST） / 湿球しきい値 '+f.params.thr+'℃ / 確率補正: '+(Object.keys(f.calib||{}).length?'実測で学習済み':'未学習');
-  $('#notice').textContent=f.stale?'最新の取得に失敗、または更新中のため、約'+f.age_min+'分前のデータを表示しています。':'';
+  const bad=f.models.filter(m=>m.kind=='error').length;
+  $('#notice').textContent=(f.stale?'最新の取得に失敗、または更新中のため、約'+f.age_min+'分前のデータを表示しています。':'')+
+    (bad?(f.stale?' ':'')+'取得できなかった予報モデルが'+bad+'件あります（「モデル比較」タブで理由を確認できます）。':'');
 }
 
 /* ---------- 各タブ ---------- */
@@ -1443,7 +1459,7 @@ function drawModel(){
     '<tr><td><b>SNOW CAST 統合</b></td><td>-</td>'+D.map(d=>`<td style="background:${heat(d.p||0)};color:#fff">${pct(d.p)}</td>`).join('')+'</tr>'+
     M.map(m=>`<tr><td>${m.label}<span class="tag">${m.kind=='ens'?m.members+'メンバー':'確定論'}</span></td><td>${m.weight}</td>`+
       D.map(d=>{const v=d.by[m.key];return `<td style="background:${v==null?'transparent':heat(v)}">${v==null?'':pct(v)}</td>`}).join('')+'</tr>').join('')+
-    FC.models.filter(m=>m.kind=='error').map(m=>`<tr><td class="err" colspan="${D.length+2}">取得失敗: ${m.label}</td></tr>`).join('');
+    FC.models.filter(m=>m.kind=='error').map(m=>`<tr><td class="err" colspan="${D.length+2}">取得失敗: ${esc(m.label)}　${esc(m.error||'')}</td></tr>`).join('');
   mk('#cModel',{type:'line',data:{labels:H72.map(h=>hh(h.time)),datasets:[
     ...M.map((m,i)=>({label:m.label,data:H72.map(h=>h.by[m.key]==null?null:h.by[m.key]*100),borderColor:COLORS[i%8],pointRadius:0,borderWidth:1.5,tension:.2})),
     {label:'統合',data:H72.map(h=>h.p*100),borderColor:'#fff',borderWidth:3,pointRadius:0}]},
