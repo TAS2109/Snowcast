@@ -23,6 +23,7 @@ SNOW CAST  -  複数予報モデル統合による降雪確率サイト (Python 
        ※ workers は 1 に固定（バックグラウンド処理が各ワーカーで重複するため）。
          threads を増やすと、予報取得中でも /health や画面が固まらない。
 環境変数: SNOWCAST_DB (DBパス), SNOWCAST_BG=0 (バックグラウンド処理を無効化), PORT
+    SNOWCAST_OPENMETEO_KEY Open-Meteo 有料プランのAPIキー(任意)
     SNOWCAST_ADMIN_TOKEN   設定すると /api/retrain と /api/observe にトークンが必要になる
                            (ヘッダ X-Admin-Token または ?token=)。公開URLで運用するなら設定推奨
   Render無料プラン対策（永続ディスクなしでも検証データを残す）:
@@ -101,6 +102,10 @@ BACKUP_TOKEN = os.environ.get("SNOWCAST_BACKUP_TOKEN", "")
 BACKUP_BRANCH = os.environ.get("SNOWCAST_BACKUP_BRANCH", "snowcast-data")
 BACKUP_FILE = "snowcast.sqlite.gz"
 ADMIN_TOKEN = os.environ.get("SNOWCAST_ADMIN_TOKEN", "")
+OM_KEY = os.environ.get("SNOWCAST_OPENMETEO_KEY", "")   # Open-Meteo 有料プランのAPIキー(任意)。設定すると上限の影響を受けにくい
+SRC_TTL = 3 * 3600            # 各予報モデルの取得結果を再利用する時間（モデル自体の更新は6時間おき程度）
+SRC_FALLBACK_MAX = 18 * 3600  # 取得に失敗したとき、この時間内の前回結果なら代わりに使う
+FRESH_MIN_INTERVAL = 600      # 「更新」ボタンで再取得を許す最短間隔(秒)
 BACKUP_INTERVAL_H = float(os.environ.get("SNOWCAST_BACKUP_H", "6"))
 DB_PATH = os.environ.get("SNOWCAST_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "snowcast.sqlite"))
 
@@ -117,6 +122,10 @@ except Exception:
 _db_lock = threading.Lock()
 _fc_lock = threading.Lock()
 _cache = {"time": 0, "data": None}
+_src_cache = {}     # (kind, model) -> (取得時刻, データ)
+_src_lock = threading.Lock()
+_blocked = {}       # ホスト名 -> 上限解除の時刻(epoch)
+_last_fresh = [0.0]
 _train_lock = threading.Lock()
 _refreshing = threading.Event()
 
@@ -136,9 +145,17 @@ def tstr(dt):
     return dt.strftime("%Y-%m-%dT%H:00")
 
 
+def _next_utc_midnight():
+    n = datetime.now(timezone.utc)
+    return (n.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).timestamp()
+
+
 def http_get(url, params=None, timeout=25, retries=2):
     if params:
         url = url + "?" + urlparse.urlencode(params)
+    host = urlparse.urlparse(url).netloc
+    if _blocked.get(host, 0) > time.time():
+        raise RuntimeError("HTTP 429: 予報元の1日の取得上限に達しています（日本時間9時ごろに回復）")
     last = None
     for k in range(retries + 1):
         try:
@@ -152,6 +169,10 @@ def http_get(url, params=None, timeout=25, retries=2):
             except Exception:  # noqa
                 reason = e.reason
             last = RuntimeError("HTTP %s: %s" % (e.code, str(reason)[:160]))
+            if e.code == 429 and "daily" in str(reason).lower():
+                _blocked[host] = _next_utc_midnight()   # 当日中は再試行しても無駄（他の呼び出しも止める）
+                log.warning("daily limit reached on %s; pausing until UTC midnight", host)
+                break
             if 400 <= e.code < 500 and e.code != 429:
                 break                       # 入力不正は再試行しても同じ
             if k < retries:
@@ -506,15 +527,24 @@ def keepalive_loop(url):
 # 予報データ取得 (Open-Meteo)
 # ----------------------------------------------------------------------------
 def _base_params():
-    return {
+    p = {
         "latitude": LOCATION["lat"], "longitude": LOCATION["lon"],
         "elevation": LOCATION["elev"], "timezone": "Asia/Tokyo",
         "forecast_days": HORIZON_DAYS + 1,
     }
+    if OM_KEY:
+        p["apikey"] = OM_KEY
+    return p
+
+
+def _om_host(kind):
+    pre = "customer-" if OM_KEY else ""
+    return "https://%s%s.open-meteo.com/v1/%s" % (pre, "ensemble-api" if kind == "ens" else "api",
+                                                  "ensemble" if kind == "ens" else "forecast")
 
 
 def fetch_det(model):
-    url = "https://api.open-meteo.com/v1/forecast"
+    url = _om_host("det")
     last = None
     for vars_, minimal in ((DET_VARS_FULL, False), (DET_VARS_CORE, False), (DET_VARS_CORE, True)):
         try:
@@ -563,7 +593,7 @@ def _parse_ens(js):
 
 def fetch_ens(model):
     """アンサンブル全メンバー取得。850hPa気温つき→失敗時は地上要素のみで再取得。"""
-    url = "https://ensemble-api.open-meteo.com/v1/ensemble"
+    url = _om_host("ens")
     last = None
     for vars_, retries in ((ENS_VARS_850, 1), (ENS_VARS, 2)):
         try:
@@ -572,17 +602,38 @@ def fetch_ens(model):
             return _parse_ens(http_json(url, p, timeout=40, retries=retries))
         except Exception as e:  # noqa
             last = e
+            if str(e).startswith("HTTP 429"):
+                break
     raise last
 
 
-def fetch_all():
+def _cached_fetch(kind, key, fn, fresh=False):
+    """モデルごとに取得結果を SRC_TTL 秒再利用する。失敗しても前回結果が新しければそれを使う。"""
+    now = time.time()
+    with _src_lock:
+        hit = _src_cache.get((kind, key))
+    if hit and not fresh and now - hit[0] < SRC_TTL:
+        return hit[1]
+    try:
+        data = fn(key)
+    except Exception as e:  # noqa
+        if hit and now - hit[0] < SRC_FALLBACK_MAX:
+            log.warning("%s %s fetch failed (%s); using data from %d min ago", kind, key, e, (now - hit[0]) / 60)
+            return hit[1]
+        raise
+    with _src_lock:
+        _src_cache[(kind, key)] = (now, data)
+    return data
+
+
+def fetch_all(fresh=False):
     det, ens, errors = {}, {}, {}
     jobs = []
     with ThreadPoolExecutor(max_workers=8) as ex:
         for key, _ in DET_MODELS:
-            jobs.append(("det", key, ex.submit(fetch_det, key)))
+            jobs.append(("det", key, ex.submit(_cached_fetch, "det", key, fetch_det, fresh)))
         for key, _ in ENS_MODELS:
-            jobs.append(("ens", key, ex.submit(fetch_ens, key)))
+            jobs.append(("ens", key, ex.submit(_cached_fetch, "ens", key, fetch_ens, fresh)))
         for kind, key, fut in jobs:
             try:
                 (det if kind == "det" else ens)[key] = fut.result()
@@ -595,10 +646,10 @@ def fetch_all():
 # ----------------------------------------------------------------------------
 # 統合
 # ----------------------------------------------------------------------------
-def build_forecast(det=None, ens=None, errors=None, start=None):
+def build_forecast(det=None, ens=None, errors=None, start=None, fresh=False):
     """予報を取得し、モデル毎に雪判別→統合。(公開JSON, 検証用行, 最終行) を返す。"""
     if det is None and ens is None:
-        det, ens, errors = fetch_all()
+        det, ens, errors = fetch_all(fresh)
     errors = errors or {}
     if not det and not ens:
         raise RuntimeError("予報データを取得できませんでした: " + json.dumps(errors, ensure_ascii=False))
@@ -853,7 +904,7 @@ def _refresh_async():
     threading.Thread(target=run, daemon=True, name="snowcast-refresh").start()
 
 
-def get_forecast(force=False):
+def get_forecast(force=False, fresh=False):
     t0 = time.time()
     if not force and _cache["data"]:
         age = time.time() - _cache["time"]
@@ -867,7 +918,7 @@ def get_forecast(force=False):
         if _cache["data"] and (_cache["time"] >= t0 or (not force and time.time() - _cache["time"] < CACHE_TTL)):
             return _cache["data"]
         try:
-            out, snap_rows, final_rows = build_forecast()
+            out, snap_rows, final_rows = build_forecast(fresh=fresh)
         except Exception:
             if _cache["data"] and time.time() - _cache["time"] < STALE_MAX:
                 log.warning("forecast refresh failed; serving stale cache")
@@ -1190,7 +1241,11 @@ def health():
 @app.route("/api/forecast")
 def api_forecast():
     try:
-        return jsonify(get_forecast(force=request.args.get("refresh") == "1"))
+        want = request.args.get("refresh") == "1"
+        fresh = want and time.time() - _last_fresh[0] > FRESH_MIN_INTERVAL    # 連打でAPI上限を消費しない
+        if fresh:
+            _last_fresh[0] = time.time()
+        return jsonify(get_forecast(force=want, fresh=fresh))
     except Exception as e:  # noqa
         log.exception("forecast failed")
         return jsonify({"error": str(e)}), 502
@@ -1428,7 +1483,7 @@ function drawHero(){
   $('#gen').textContent='更新 '+f.generated_at+'（JST） / 湿球しきい値 '+f.params.thr+'℃ / 確率補正: '+(Object.keys(f.calib||{}).length?'実測で学習済み':'未学習');
   const bad=f.models.filter(m=>m.kind=='error').length;
   $('#notice').textContent=(f.stale?'最新の取得に失敗、または更新中のため、約'+f.age_min+'分前のデータを表示しています。':'')+
-    (bad?(f.stale?' ':'')+'取得できなかった予報モデルが'+bad+'件あります（「モデル比較」タブで理由を確認できます）。':'');
+    (bad?(f.stale?' ':'')+(f.models.some(m=>m.kind=='error'&&/429|上限/.test(m.error||''))?'予報元（Open-Meteo）の1日の取得上限に達しています。日本時間9時ごろに回復します。':'取得できなかった予報モデルが'+bad+'件あります（「モデル比較」タブで理由を確認できます）。'):'');
 }
 
 /* ---------- 各タブ ---------- */
