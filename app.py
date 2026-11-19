@@ -10,6 +10,7 @@ SNOW CAST  -  複数予報モデル統合による降雪確率サイト (Python 
   - 実測       : 気象庁 アメダス 甲府(49142) ＋ 周辺アメダス（雪の観測・積雪深・風・日照）
   - 追加の予報元: UKMO / Météo-France / カナダGDPS / CMA、MET Norway（Open-Meteoを経由しない独立系）
   - 追加アンサンブル: ICON-EPS / ECMWF AIFS-ENS / MOGREPS-G
+  - AI系・豪州: ECMWF AIFS / GraphCast / NOAA AIGFS / 豪州BoM ACCESS-G、アンサンブル ACCESS-GE
   - 公式       : 気象庁 府県予報（天気・降水確率・気温・週間）と警報・注意報（大雪・風雪・なだれ・着雪など）
   - 追加の要素 : 風速・雲量・モデル降雪量・0℃高度（確定論モデルのみ。表示用で、雪判別の計算には使わない）
 
@@ -89,6 +90,11 @@ DET_MODELS = [
     ("cma_grapes_global", "中国 CMA"),
     # 韓国 KMA (kma_seamless) は甲府では全期間 null が返るため除外
     ("metno", "MET Norway"),          # Open-Meteoを経由しない独立系（fetch_metno）
+    # AI系・豪州モデル（追加分。850hPa気温・降雪量・0℃高度が無い場合は fetch_det が自動で要素を減らして再取得）
+    ("ecmwf_aifs025_single", "ECMWF AIFS (AI)"),
+    ("gfs_graphcast025", "GraphCast (AI)"),
+    ("ncep_aigfs025", "NOAA AIGFS (AI)"),
+    ("bom_access_global", "豪州 BoM ACCESS-G"),
 ]
 ENS_MODELS = [
     ("gem_global", "GEPS (カナダ)"),
@@ -97,11 +103,14 @@ ENS_MODELS = [
     ("icon_seamless", "ICON-EPS (DWD)"),
     ("ecmwf_aifs025", "ECMWF AIFS-ENS"),
     ("ukmo_global_ensemble_20km", "MOGREPS-G (UKMO)"),
+    ("bom_access_global_ensemble", "ACCESS-GE (豪州BoM)"),
 ]
 # 実績がまだ無い新モデルの初期重み（検証データが溜まると再学習で置き換わる）
 DEFAULT_W = {"cma_grapes_global": 0.6, "gem_seamless": 0.8, "metno": 0.8,
              "meteofrance_seamless": 0.8, "ukmo_seamless": 0.9, "ens_icon_seamless": 0.9,
-             "ens_ecmwf_aifs025": 0.8, "ens_ukmo_global_ensemble_20km": 0.8}
+             "ens_ecmwf_aifs025": 0.8, "ens_ukmo_global_ensemble_20km": 0.8,
+             "ecmwf_aifs025_single": 0.8, "gfs_graphcast025": 0.6, "ncep_aigfs025": 0.6,
+             "bom_access_global": 0.6, "ens_bom_access_global_ensemble": 0.7}
 VARIANTS_ON = os.environ.get("SNOWCAST_VARIANTS", "1") != "0"   # 0 で計算パターンの生成を止める（軽くしたいとき）
 DET_VARS_EXTRA = ["wind_speed_10m", "cloud_cover", "snowfall", "freezing_level_height"]   # 表示用
 DET_VARS_FULL = ["temperature_2m", "relative_humidity_2m", "precipitation",
@@ -924,8 +933,9 @@ VARIANT_SETS = [      # (key, 名前, 短い名前, 説明, 対象モデルの�
     ("ens", "アンサンブルのみ", "アンサンブル", "アンサンブル（多数メンバー）だけで統合", lambda s: s["kind"] == "ens", True),
     ("jma", "気象庁のみ", "気象庁", "気象庁 MSM・GSM だけ", lambda s: s["key"] in ("jma_msm", "jma_gsm"), False),
     ("ecmwf", "ECMWF系のみ", "ECMWF", "ECMWF の確定論・ENS・AIFS だけ",
-     lambda s: s["key"] in ("ecmwf_ifs025", "ens_ecmwf_ifs025", "ens_ecmwf_aifs025"), False),
-    ("noaa", "NOAA系のみ", "NOAA", "GFS と GEFS だけ", lambda s: s["key"] in ("gfs_seamless", "ens_gfs025"), False),
+     lambda s: s["key"] in ("ecmwf_ifs025", "ecmwf_aifs025_single", "ens_ecmwf_ifs025", "ens_ecmwf_aifs025"), False),
+    ("noaa", "NOAA系のみ", "NOAA", "GFS・GraphCast・AIGFS・GEFS だけ",
+     lambda s: s["key"] in ("gfs_seamless", "gfs_graphcast025", "ncep_aigfs025", "ens_gfs025"), False),
 ]
 
 
@@ -1901,6 +1911,11 @@ padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
 display:flex;gap:6px;overflow-x:auto;border-bottom:1px solid var(--ln)}
 .tab{flex:1;min-width:76px;border:0;background:transparent;color:var(--sub);font-size:14px;font-weight:600;padding:9px 10px;border-radius:10px;cursor:pointer}
 .tab[aria-selected=true]{background:var(--ice);color:#06223a}
+.subtabs{margin:10px 0 0;display:flex;gap:6px;overflow-x:auto}
+.subtabs[hidden]{display:none}
+.subtab{border:1px solid var(--ln);background:var(--bg2);color:var(--sub);border-radius:999px;padding:6px 14px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}
+.subtab[aria-selected=true]{background:var(--ice);color:#06223a;border-color:var(--ice)}
+.subtab:focus-visible{outline:2px solid var(--ice);outline-offset:2px}
 section{display:none;padding:14px 0 40px}
 section.on{display:block}
 h2{font-size:16px;margin:22px 0 10px}
@@ -1956,13 +1971,12 @@ th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:
 <nav class="tabs" role="tablist">
 <button class="tab" role="tab" data-tab="fc" aria-selected="true">予報</button>
 <button class="tab" role="tab" data-tab="snow" aria-selected="false">積雪</button>
-<button class="tab" role="tab" data-tab="model" aria-selected="false">モデル比較</button>
-<button class="tab" role="tab" data-tab="mem" aria-selected="false">メンバー</button>
-<button class="tab" role="tab" data-tab="var" aria-selected="false">パターン</button>
+<button class="tab" role="tab" data-tab="map" aria-selected="false">マップ</button>
 <button class="tab" role="tab" data-tab="live" aria-selected="false">実況・公式</button>
-<button class="tab" role="tab" data-tab="ver" aria-selected="false">精度</button>
-<button class="tab" role="tab" data-tab="data" aria-selected="false">データ</button>
+<button class="tab" role="tab" data-tab="model" aria-selected="false">モデル</button>
+<button class="tab" role="tab" data-tab="ver" aria-selected="false">検証</button>
 </nav>
+<div class="subtabs" id="subtabs" role="tablist" hidden></div>
 
 <section id="s-fc" class="on">
 <h2>11日間の雪予報</h2><div class="days" id="days"></div>
@@ -2035,11 +2049,19 @@ th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:
 <div class="scroll"><table id="tObs"></table></div>
 </section>
 
-<section id="s-data">
+<section id="s-map">
+<h2>マップ</h2>
+<div class="note">準備中です。ここに雨雲レーダー・アメダス・各モデルの予報などを重ねて表示できるようにする予定です。</div>
+</section>
+
+<section id="s-trend">
 <h2>予報の推移（いつから、どう変わってきたか）</h2>
 <div class="seg" role="group"><button class="chip on" data-tm="p">最大降雪確率</button><button class="chip" data-tm="cm">日降雪量</button></div>
 <div class="canvas"><canvas id="cTrend"></canvas></div>
 <div class="note" id="trendNote">横軸は予報を出した時刻、線は対象の日です。右に向かって線が安定していれば予報が固まっています。大きく上下するときは不確実です。</div>
+</section>
+
+<section id="s-data">
 <h2>時間別データ</h2>
 <div class="row" style="margin-bottom:8px">
 <div class="seg" role="group"><button class="chip on" data-dr="48">48時間</button><button class="chip" data-dr="120">5日</button><button class="chip" data-dr="999">全て</button></div>
@@ -2355,7 +2377,7 @@ async function drawLive(){
 /* ---------- タブ・操作 ---------- */
 function draw(){
   if(!FC) return;
-  if(TAB=='fc') drawFc(); else if(TAB=='snow') drawSnow(); else if(TAB=='model') drawModel(); else if(TAB=='data') drawData(); else if(TAB=='live') drawLive(); else if(TAB=='mem') drawMem(); else if(TAB=='var') drawVar();
+  if(TAB=='fc') drawFc(); else if(TAB=='snow') drawSnow(); else if(TAB=='model') drawModel(); else if(TAB=='data') drawData(); else if(TAB=='trend') drawTrendTab(); else if(TAB=='live') drawLive(); else if(TAB=='mem') drawMem(); else if(TAB=='var') drawVar();
   else if(TAB=='ver' && !VERLOADED){VERLOADED=true; loadVer().catch(()=>{$('#ver').textContent='検証データを取得できませんでした。しばらくしてから再度開いてください。';VERLOADED=false;}); loadObs().catch(()=>{});}
 }
 const COLS=[['time','時刻',h=>hh(h.time)],['p','降雪確率',h=>pct(h.p)],['lo','最小',h=>pct(h.lo)],['hi','最大',h=>pct(h.hi)],
@@ -2373,8 +2395,8 @@ function drawData(){
   $('#dCount').textContent=R.length+'件';
   $('#tData').innerHTML='<tr>'+COLS.map(c=>`<th class="sortable" data-k="${c[0]}">${c[1]}${SORT.k==c[0]?(SORT.d>0?' ▲':' ▼'):''}</th>`).join('')+'</tr>'+
     R.map(h=>'<tr>'+COLS.map((c,i)=>i==1?`<td style="background:${heat(h.p)}">${c[2](h)}</td>`:`<td>${c[2](h)}</td>`).join('')+'</tr>').join('');
-  loadTrend().then(drawTrend).catch(()=>{$('#trendNote').textContent='予報の推移を取得できませんでした。';});
 }
+function drawTrendTab(){ loadTrend().then(drawTrend).catch(()=>{$('#trendNote').textContent='予報の推移を取得できませんでした。';}); }
 async function loadTrend(){ if(!TREND) TREND=await fetch('/api/trend').then(r=>r.json()); }
 function drawTrend(){
   const T=TREND; if(!T||!T.issues.length){ $('#trendNote').textContent='予報の記録がまだ少ないため、数日たつと表示されます（6時間ごとに記録）。'; return; }
@@ -2402,13 +2424,23 @@ document.querySelectorAll('[data-dr]').forEach(b=>b.onclick=()=>{document.queryS
 document.querySelectorAll('[data-tm]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tm]').forEach(x=>x.classList.remove('on'));b.classList.add('on');TM=b.dataset.tm;drawTrend();});
 $('#onlySnow').onchange=()=>{if(FC)drawData();};
 
+/* 画面（ページ）= TAB。上のタブは「グループ」、モデル／検証だけ下に小タブが出る */
+const GROUPS={fc:['fc'],snow:['snow'],map:['map'],live:['live'],model:['model','mem','var'],ver:['ver','trend','data']};
+const SUBLABEL={model:'モデル比較',mem:'メンバー別',var:'計算パターン',ver:'精度',trend:'予報の推移',data:'時間別データ'};
+const GROUP_OF={}; Object.entries(GROUPS).forEach(([g,ps])=>ps.forEach(p=>GROUP_OF[p]=g));
+const LASTSUB={};
 function setTab(t){
-  TAB=t;
-  document.querySelectorAll('.tab').forEach(b=>b.setAttribute('aria-selected',b.dataset.tab==t));
+  if(!GROUP_OF[t]) t='fc';
+  TAB=t; const g=GROUP_OF[t]; LASTSUB[g]=t;
+  document.querySelectorAll('.tab').forEach(b=>b.setAttribute('aria-selected',b.dataset.tab==g));
+  const sub=$('#subtabs'), ps=GROUPS[g];
+  sub.hidden=ps.length<2;
+  sub.innerHTML=ps.length<2?'':ps.map(p=>`<button class="subtab" role="tab" data-sub="${p}" aria-selected="${p==t}">${SUBLABEL[p]}</button>`).join('');
   document.querySelectorAll('section').forEach(s=>s.classList.toggle('on',s.id=='s-'+t));
   history.replaceState(null,'','#'+t); draw();
 }
-document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>setTab(b.dataset.tab));
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>setTab(LASTSUB[b.dataset.tab]||GROUPS[b.dataset.tab][0]));
+$('#subtabs').addEventListener('click',e=>{const b=e.target.closest('.subtab'); if(b) setTab(b.dataset.sub);});
 document.querySelectorAll('[data-r]').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('[data-r]').forEach(x=>x.classList.remove('on'));b.classList.add('on');RANGE=+b.dataset.r;if(FC)drawHour();});
 
@@ -2452,7 +2484,7 @@ $('#btnTrain').onclick=async()=>{
 };
 
 (async()=>{
-  const h=location.hash.slice(1); if(['fc','snow','model','mem','var','live','ver','data'].includes(h)) TAB=h;
+  const h=location.hash.slice(1); if(GROUP_OF[h]) TAB=h;
   await loadForecast(false);
   setTab(TAB);
   loadObs().then(()=>{if(TAB=='fc'&&FC)drawHour();}).catch(()=>{});
