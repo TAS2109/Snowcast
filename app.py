@@ -1234,154 +1234,235 @@ INDEX_HTML = r"""<!doctype html>
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b1424">
 <title>SNOW CAST - 甲府の降雪確率</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
-:root{--bg:#0b1624;--card:#13243a;--line:#223a57;--tx:#e8f1fb;--sub:#8fa8c4;--ac:#6cc3ff;--warn:#ffb454}
-*{box-sizing:border-box}
-body{margin:0;background:linear-gradient(180deg,#0a1422,#0f2238 60%,#0b1624);color:var(--tx);font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif;line-height:1.5}
-header{padding:18px 16px 6px;max-width:1100px;margin:auto}
-h1{margin:0;font-size:22px;letter-spacing:.12em}
-h1 small{font-size:12px;color:var(--sub);letter-spacing:0;margin-left:8px;font-weight:400}
-main{max-width:1100px;margin:auto;padding:8px 12px 40px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}
-.card h2{font-size:15px;margin:0 0 10px;color:var(--ac)}
-.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.btn{background:#1b3454;color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:5px 12px;cursor:pointer;font-size:13px}
-.btn.on{background:var(--ac);color:#06223a;border-color:var(--ac)}
-.kpi{display:flex;gap:10px;flex-wrap:wrap}
-.kpi div{flex:1;min-width:130px;background:#0f1d30;border-radius:10px;padding:10px}
-.kpi b{display:block;font-size:24px}
-.kpi span{font-size:12px;color:var(--sub)}
-.days{display:grid;grid-template-columns:repeat(auto-fill,minmax(125px,1fr));gap:8px}
-.day{border-radius:10px;padding:8px;background:#0f1d30;border:1px solid var(--line)}
+:root{--bg:#0b1424;--bg2:#101d33;--ln:#1f3350;--tx:#f2f7ff;--sub:#8ea3c0;--ice:#9fd3ff;--warm:#ffc27a;--ok:#7be0a1;
+--r:16px}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html{scroll-padding-top:120px}
+body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.6 -apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif;
+padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+.wrap{max-width:960px;margin:auto;padding:0 14px}
+.top{display:flex;justify-content:space-between;align-items:center;padding:14px 0 6px}
+.brand{font-weight:800;font-size:17px;letter-spacing:.14em}
+.brand small{display:block;font-weight:400;font-size:12px;letter-spacing:0;color:var(--sub)}
+.iconbtn{border:1px solid var(--ln);background:var(--bg2);color:var(--tx);border-radius:999px;padding:8px 14px;font-size:13px;cursor:pointer}
+.iconbtn:disabled{opacity:.5;cursor:wait}
+.iconbtn:focus-visible,.tab:focus-visible,.chip:focus-visible{outline:2px solid var(--ice);outline-offset:2px}
+
+/* ヒーロー: 結論の一文 + 24時間の帯 */
+.hero{padding:18px 0 6px}
+.hero h1{margin:0;font-size:clamp(24px,6.4vw,38px);line-height:1.25;font-weight:800}
+.hero p{margin:8px 0 0;color:var(--sub);font-size:14px}
+.strip{display:grid;grid-template-columns:repeat(24,1fr);gap:2px;margin-top:18px;height:64px;align-items:end}
+.cell{border-radius:4px 4px 2px 2px;min-height:6px;background:var(--ice);cursor:pointer;border:0;padding:0;transition:opacity .15s}
+.cell.sel{outline:2px solid var(--tx);outline-offset:1px}
+.ticks{display:grid;grid-template-columns:repeat(24,1fr);gap:2px;font-size:11px;color:var(--sub);margin-top:4px}
+.ticks span{white-space:nowrap;overflow:visible}
+#pick{min-height:24px;margin-top:8px;font-size:13px;color:var(--tx)}
+#pick b{color:var(--ice)}
+
+.notice{margin:10px 0 0;padding:8px 12px;border-radius:10px;background:#3a2a12;color:var(--warm);font-size:13px}
+.notice:empty{display:none}
+
+/* タブ */
+.tabs{position:sticky;top:0;z-index:5;margin:14px -14px 0;padding:8px 14px;background:rgba(11,20,36,.92);backdrop-filter:blur(8px);
+display:flex;gap:6px;overflow-x:auto;border-bottom:1px solid var(--ln)}
+.tab{flex:1;min-width:76px;border:0;background:transparent;color:var(--sub);font-size:14px;font-weight:600;padding:9px 10px;border-radius:10px;cursor:pointer}
+.tab[aria-selected=true]{background:var(--ice);color:#06223a}
+section{display:none;padding:14px 0 40px}
+section.on{display:block}
+h2{font-size:16px;margin:22px 0 10px}
+h2:first-child{margin-top:0}
+.note{font-size:12.5px;color:var(--sub);margin:8px 0}
+.seg{display:inline-flex;background:var(--bg2);border:1px solid var(--ln);border-radius:999px;padding:3px;margin-bottom:10px}
+.chip{border:0;background:transparent;color:var(--sub);padding:5px 14px;border-radius:999px;font-size:13px;cursor:pointer}
+.chip.on{background:var(--tx);color:#0b1424;font-weight:700}
+.canvas{position:relative;height:280px}
+
+/* 日別 */
+.days{display:flex;gap:8px;overflow-x:auto;scroll-snap-type:x proximity;padding-bottom:8px;margin:0 -14px;padding:0 14px 8px}
+.day{flex:0 0 108px;scroll-snap-align:start;background:var(--bg2);border-radius:14px;padding:10px;border:1px solid var(--ln)}
+.day.today{border-color:var(--ice)}
 .day .d{font-size:12px;color:var(--sub)}
-.day .p{font-size:26px;font-weight:700}
-.day .s{font-size:11px;color:var(--sub)}
-table{border-collapse:collapse;width:100%;font-size:12px}
-th,td{padding:5px 6px;text-align:center;border-bottom:1px solid var(--line)}
-th:first-child,td:first-child{text-align:left;white-space:nowrap}
-.scroll{overflow-x:auto}
-.note{font-size:12px;color:var(--sub)}
-.canvas{position:relative;height:300px}
-.tag{display:inline-block;font-size:11px;padding:1px 6px;border-radius:6px;background:#1b3454;color:var(--sub);margin-left:4px}
-.err{color:var(--warn)}
-.btn:disabled{opacity:.5;cursor:wait}
+.day .i{font-size:22px;height:30px;line-height:30px}
+.day .p{font-size:24px;font-weight:800;line-height:1.1}
+.bar{height:4px;border-radius:2px;background:var(--ln);margin:6px 0}
+.bar i{display:block;height:100%;border-radius:2px;background:var(--ice)}
+.day .s{font-size:12px;color:var(--sub)}
+.day .z{font-size:12px;color:var(--tx);margin-top:2px}
+
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{padding:7px 6px;text-align:center;border-bottom:1px solid var(--ln)}
+th{color:var(--sub);font-weight:600}
+th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:var(--bg);white-space:nowrap}
+.scroll{overflow-x:auto;margin:0 -14px;padding:0 14px}
+.tag{display:inline-block;font-size:11px;padding:0 6px;border-radius:6px;background:var(--bg2);color:var(--sub);margin-left:4px}
+.err{color:var(--warm)}
+.skel{height:30px;border-radius:8px;background:linear-gradient(90deg,var(--bg2),#17284a,var(--bg2));background-size:200% 100%;animation:sk 1.4s linear infinite}
+@keyframes sk{to{background-position:-200% 0}}
+@media (prefers-reduced-motion:reduce){.skel{animation:none}.cell{transition:none}}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.foot{font-size:12px;color:var(--sub);padding:0 0 30px}
 </style>
 </head>
 <body>
-<header><h1>SNOW CAST<small>甲府市 / 複数モデル統合 降雪確率</small></h1>
-<div class="note" id="gen">読み込み中…</div></header>
-<main>
-<div class="card"><div class="kpi" id="kpi"></div></div>
+<div class="wrap">
+<div class="top"><div class="brand">SNOW CAST<small>甲府市の降雪確率</small></div>
+<button class="iconbtn" id="btnRefresh">更新</button></div>
 
-<div class="card"><h2>1時間ごとの降雪確率</h2>
-<div class="row" style="margin-bottom:8px">
-<button class="btn on" data-r="48">48時間</button><button class="btn" data-r="120">5日</button><button class="btn" data-r="264">11日</button></div>
+<div class="hero">
+<h1 id="headline"><span class="skel" style="display:block;width:70%">&nbsp;</span></h1>
+<p id="subline"></p>
+<div class="strip" id="strip" role="list" aria-label="今後24時間の降雪確率"></div>
+<div class="ticks" id="ticks"></div>
+<div id="pick"></div>
+<div class="notice" id="notice"></div>
+<div class="note" id="gen">読み込み中…</div>
+</div>
+
+<nav class="tabs" role="tablist">
+<button class="tab" role="tab" data-tab="fc" aria-selected="true">予報</button>
+<button class="tab" role="tab" data-tab="snow" aria-selected="false">積雪</button>
+<button class="tab" role="tab" data-tab="model" aria-selected="false">モデル比較</button>
+<button class="tab" role="tab" data-tab="ver" aria-selected="false">精度</button>
+</nav>
+
+<section id="s-fc" class="on">
+<h2>11日間の雪予報</h2><div class="days" id="days"></div>
+<h2>1時間ごとの降雪確率</h2>
+<div class="seg" role="group"><button class="chip on" data-r="48">48時間</button><button class="chip" data-r="120">5日</button><button class="chip" data-r="264">11日</button></div>
 <div class="canvas"><canvas id="cHour"></canvas></div>
-<div class="note">棒: 統合降雪確率（実測で学習済みなら補正後。薄い帯=モデル間の最小〜最大） / 線: 気温・湿球温度 / 凡例の「気圧」をクリックで表示</div></div>
+<div class="note">棒: 降雪確率 / 薄い帯: モデル間の最小〜最大 / 線: 気温・湿球温度。凡例の「気圧」をタップで表示。</div>
+</section>
 
-<div class="card"><h2>11日間の雪予報</h2><div class="days" id="days"></div></div>
-
-<div class="card"><h2>予想積雪量・積雪確率</h2>
+<section id="s-snow">
+<h2>予想降雪量と積雪</h2>
 <div class="canvas"><canvas id="cSnow"></canvas></div>
+<h2>積雪が出る確率</h2>
 <div class="scroll"><table id="tSnow"></table></div>
-<div class="note">降雪量は雪水比×降水量、積雪は融雪を考慮した簡易推定。確率は各モデル・アンサンブルメンバーの比率を重み付け統合。</div></div>
+<div class="note">降雪量は雪水比×降水量、積雪は融雪を考慮した簡易推定です。確率は各モデル・アンサンブルメンバーの比率を重み付けして統合しています。</div>
+</section>
 
-<div class="card"><h2>予報モデルの比較</h2>
+<section id="s-model">
+<h2>日ごとの降雪確率（モデル別）</h2>
 <div class="scroll"><table id="tModel"></table></div>
-<div class="canvas" style="margin-top:10px"><canvas id="cModel"></canvas></div>
-<div class="note">表: 日ごとの降雪確率（モデル別）。折れ線: 直近72時間のモデル別・時間降雪確率。</div></div>
+<h2>直近72時間のモデル別</h2>
+<div class="canvas"><canvas id="cModel"></canvas></div>
+<div class="note">モデルの色が揃っているほど予報の信頼度が高く、ばらけているほど不確実です。</div>
+</section>
 
-<div class="card"><h2>予報精度の検証（過去の予報 vs アメダス実測）</h2>
+<section id="s-ver">
+<h2>予報は当たっているか</h2>
 <div id="ver" class="note">集計中…</div>
 <div class="scroll"><table id="tVer"></table></div>
-<div class="note" style="margin-top:10px">信頼度（予報確率の帯ごとの実際の雪の割合。予報確率に近いほど良好）</div>
+<h2>確率ごとの実際の雪の割合</h2>
+<div class="note">予報確率に近いほど良好です。</div>
 <div class="scroll"><table id="tRel"></table></div>
-<div class="row" style="margin-top:8px"><button class="btn" id="btnTrain">実測から再学習</button><span class="note" id="trainRes"></span></div></div>
+<div class="row" style="margin-top:12px"><button class="iconbtn" id="btnTrain">実測から再学習</button><span class="note" id="trainRes"></span></div>
+<h2>直近のアメダス実測（甲府）</h2>
+<div class="scroll"><table id="tObs"></table></div>
+</section>
 
-<div class="card"><h2>直近のアメダス実測（甲府）</h2>
-<div class="scroll"><table id="tObs"></table></div></div>
+<div class="foot">予報データ: Open-Meteo（気象庁MSM/GSM・ECMWF・NOAA・DWD・GEPS等）、実測: 気象庁アメダス。実験的な独自モデルです。防災判断は気象庁の情報を優先してください。</div>
+</div>
 
-<div class="note" style="margin-top:16px">予報データ: Open-Meteo（気象庁MSM/GSM・ECMWF・NOAA・DWD・GEPS等）、実測: 気象庁アメダス。実験的な独自モデルです。防災判断は気象庁の情報を優先してください。</div>
-</main>
 <script>
 const $=s=>document.querySelector(s);
-const WD='日月火水木金土';
-const charts={};
-const pc=p=>`rgba(108,195,255,${(0.10+0.9*p).toFixed(2)})`;
+const WD='日月火水木金土', charts={}, GRID='rgba(255,255,255,.07)', TICK='#8ea3c0';
+const COLORS=['#9fd3ff','#ffc27a','#7be0a1','#ff8fa8','#c9a6ff','#f5e663','#7fdbda','#ff9f6b'];
 const pct=p=>p==null?'-':Math.round(p*100)+'%';
 const hh=t=>t.slice(5,10).replace('-','/')+' '+t.slice(11,13)+'時';
 const dl=d=>{const x=new Date(d+'T00:00:00');return (x.getMonth()+1)+'/'+x.getDate()+'('+WD[x.getDay()]+')'};
-let FC=null, RANGE=48;
+const heat=p=>`rgba(159,211,255,${(0.10+0.85*p).toFixed(2)})`;
+const ico=p=>p>=.6?'❄️':p>=.3?'🌨️':p>=.1?'🌥️':'';
+const word=p=>p>=.6?'雪の可能性が高い':p>=.3?'雪になりそう':p>=.1?'わずかに可能性':'雪なし';
+let FC=null, RANGE=48, TAB='fc', VERLOADED=false;
+Chart.defaults.color=TICK; Chart.defaults.font.family='inherit';
 
 function mk(id,cfg){ if(charts[id]) charts[id].destroy(); charts[id]=new Chart($(id),cfg); }
-const COLORS=['#6cc3ff','#ffb454','#7be0a1','#ff7b9c','#c39bff','#f5e663','#7fdbda','#ff9f6b'];
+function showErr(m){const g=$('#gen');g.textContent='';const e=document.createElement('span');e.className='err';e.textContent=m;g.appendChild(e);$('#headline').textContent='予報を取得できません';}
 
+/* ---------- ヒーロー ---------- */
+function drawHero(){
+  const f=FC, H=f.hourly.filter(h=>h.p!=null);
+  const next=H.find(h=>h.p>=0.3), m24=Math.max(...H.slice(0,24).map(h=>h.p));
+  const dayLabel=t=>{const d=new Date(t.slice(0,10)+'T00:00:00'),n=new Date(H[0].time.slice(0,10)+'T00:00:00');
+    const k=Math.round((d-n)/864e5);return (k==0?'今日':k==1?'明日':k==2?'明後日':dl(t.slice(0,10)))+' '+(+t.slice(11,13))+'時ごろ'};
+  $('#headline').textContent = next ? (dayLabel(next.time)+'から雪の可能性（'+pct(next.p)+'）') : '11日以内に雪の予報はありません';
+  $('#subline').textContent = '今後24時間の最大降雪確率は '+pct(m24)+'。'+(next&&next.time!==H[0].time?'':'');
+  const S=H.slice(0,24);
+  $('#strip').innerHTML=S.map((h,i)=>`<button class="cell" role="listitem" data-i="${i}" aria-label="${hh(h.time)} ${pct(h.p)}" style="height:${Math.max(10,h.p*100)}%;background:${heat(h.p)}"></button>`).join('');
+  $('#ticks').innerHTML=S.map((h,i)=>`<span>${i%6==0?(+h.time.slice(11,13))+'時':''}</span>`).join('');
+  const pick=i=>{const h=S[i];document.querySelectorAll('.cell').forEach((c,k)=>c.classList.toggle('sel',k==i));
+    $('#pick').innerHTML=`<b>${hh(h.time)}</b>　降雪確率 <b>${pct(h.p)}</b>　気温 ${h.temp??'-'}℃　降水 ${h.precip??'-'}mm`;};
+  document.querySelectorAll('.cell').forEach(c=>c.onclick=()=>pick(+c.dataset.i));
+  const k=S.findIndex(h=>h.p>=0.3); pick(k>=0?k:0);
+  $('#gen').textContent='更新 '+f.generated_at+'（JST） / 湿球しきい値 '+f.params.thr+'℃ / 確率補正: '+(Object.keys(f.calib||{}).length?'実測で学習済み':'未学習');
+  $('#notice').textContent=f.stale?'最新の取得に失敗、または更新中のため、約'+f.age_min+'分前のデータを表示しています。':'';
+}
+
+/* ---------- 各タブ ---------- */
 function drawHour(){
   const H=FC.hourly.filter(h=>h.p!=null).slice(0,RANGE);
   mk('#cHour',{data:{labels:H.map(h=>hh(h.time)),datasets:[
-    {type:'bar',label:'降雪確率(%)',data:H.map(h=>h.p*100),backgroundColor:H.map(h=>pc(h.p)),yAxisID:'y',order:3},
-    {type:'line',label:'最大モデル(%)',data:H.map(h=>h.hi*100),borderColor:'rgba(255,255,255,.25)',pointRadius:0,borderWidth:1,yAxisID:'y',order:2},
-    {type:'line',label:'最小モデル(%)',data:H.map(h=>h.lo*100),borderColor:'rgba(255,255,255,.25)',pointRadius:0,borderWidth:1,yAxisID:'y',fill:'-1',backgroundColor:'rgba(255,255,255,.07)',order:2},
-    {type:'line',label:'気温(℃)',data:H.map(h=>h.temp),borderColor:'#ffb454',pointRadius:0,borderWidth:2,yAxisID:'y2',order:1},
-    {type:'line',label:'湿球温度(℃)',data:H.map(h=>h.tw),borderColor:'#7be0a1',pointRadius:0,borderWidth:2,borderDash:[4,3],yAxisID:'y2',order:1},
-    {type:'line',label:'気圧(hPa)',data:H.map(h=>h.pres),borderColor:'#c39bff',pointRadius:0,borderWidth:1.5,yAxisID:'y3',hidden:true,order:1},
-  ]},options:{maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
-    scales:{y:{min:0,max:100,title:{display:true,text:'%'},grid:{color:'#223a57'}},y2:{position:'right',grid:{display:false},title:{display:true,text:'℃'}},y3:{position:'right',display:'auto',grid:{display:false},title:{display:true,text:'hPa'}},x:{ticks:{maxTicksLimit:10,color:'#8fa8c4'}}},
-    plugins:{legend:{labels:{color:'#cfe0f3',boxWidth:12}}}}});
+    {type:'bar',label:'降雪確率(%)',data:H.map(h=>h.p*100),backgroundColor:H.map(h=>heat(h.p)),yAxisID:'y',order:3},
+    {type:'line',label:'最大モデル',data:H.map(h=>h.hi*100),borderColor:'rgba(255,255,255,.2)',pointRadius:0,borderWidth:1,yAxisID:'y',order:2},
+    {type:'line',label:'最小モデル',data:H.map(h=>h.lo*100),borderColor:'rgba(255,255,255,.2)',pointRadius:0,borderWidth:1,yAxisID:'y',fill:'-1',backgroundColor:'rgba(255,255,255,.06)',order:2},
+    {type:'line',label:'気温(℃)',data:H.map(h=>h.temp),borderColor:COLORS[1],pointRadius:0,borderWidth:2,yAxisID:'y2',order:1},
+    {type:'line',label:'湿球温度(℃)',data:H.map(h=>h.tw),borderColor:COLORS[2],pointRadius:0,borderWidth:2,borderDash:[4,3],yAxisID:'y2',order:1},
+    {type:'line',label:'気圧(hPa)',data:H.map(h=>h.pres),borderColor:COLORS[4],pointRadius:0,borderWidth:1.5,yAxisID:'y3',hidden:true,order:1}]},
+    options:{maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
+      scales:{y:{min:0,max:100,grid:{color:GRID},ticks:{callback:v=>v+'%'}},y2:{position:'right',grid:{display:false},ticks:{callback:v=>v+'℃'}},y3:{position:'right',display:'auto',grid:{display:false}},x:{grid:{display:false},ticks:{maxTicksLimit:6}}},
+      plugins:{legend:{labels:{boxWidth:10,usePointStyle:true}}}}});
 }
-
-function render(){
-  const f=FC; $('#gen').textContent='更新 '+f.generated_at+'（JST） / 湿球温度しきい値 '+f.params.thr+'℃ / 確率補正: '+(Object.keys(f.calib||{}).length?'実測で学習済み':'未学習（データ蓄積中）')+(f.stale?' / ⚠ 約'+f.age_min+'分前のデータを表示中（更新中）':'');
-  const H=f.hourly.filter(h=>h.p!=null);
-  const m24=Math.max(...H.slice(0,24).map(h=>h.p));
-  const nextSnow=H.find(h=>h.p>=0.3);
-  const D=f.daily;
-  const maxCm=Math.max(...D.map(d=>d.cm||0));
-  $('#kpi').innerHTML=`<div><span>今後24時間の最大降雪確率</span><b>${pct(m24)}</b></div>
-   <div><span>次に雪が降りそうな時間(30%以上)</span><b style="font-size:17px">${nextSnow?hh(nextSnow.time):'11日以内なし'}</b></div>
-   <div><span>期間内の最大降雪量(日)</span><b>${maxCm.toFixed(1)}<small> cm</small></b></div>
-   <div><span>利用モデル</span><b>${f.models.filter(m=>m.kind!='error').length}<small> 系統</small></b></div>`;
+function drawFc(){
+  const D=FC.daily;
+  $('#days').innerHTML=D.map((d,i)=>`<div class="day${i==0?' today':''}"><div class="d">${i==0?'今日':dl(d.date)}</div><div class="i">${ico(d.p||0)}</div>
+    <div class="p">${pct(d.p)}</div><div class="bar"><i style="width:${(d.p||0)*100}%"></i></div>
+    <div class="z">${word(d.p||0)}</div>
+    <div class="s">${d.tmin!=null?Math.round(d.tmin)+'〜'+Math.round(d.tmax)+'℃':''}</div>
+    <div class="s">降雪 ${d.cm??'-'}cm</div></div>`).join('');
   drawHour();
-  $('#days').innerHTML=D.map(d=>`<div class="day" style="background:${pc((d.p||0)*0.6)}"><div class="d">${dl(d.date)}</div>
-    <div class="p">${pct(d.p)}</div><div class="s">${d.tmin!=null?d.tmin+'〜'+d.tmax+'℃':''}</div>
-    <div class="s">降雪 ${d.cm??'-'}cm / 積雪 ${d.dmax??'-'}cm</div><div class="s">一致度 ${pct(d.agree)}</div></div>`).join('');
+}
+function drawSnow(){
+  const D=FC.daily;
   mk('#cSnow',{type:'bar',data:{labels:D.map(d=>dl(d.date)),datasets:[
-    {label:'予想降雪量(cm/日)',data:D.map(d=>d.cm),backgroundColor:'rgba(108,195,255,.7)'},
-    {label:'予想最大積雪(cm)',data:D.map(d=>d.dmax),backgroundColor:'rgba(255,255,255,.55)'}]},
-    options:{maintainAspectRatio:false,scales:{y:{beginAtZero:true,grid:{color:'#223a57'}},x:{ticks:{color:'#8fa8c4'}}},plugins:{legend:{labels:{color:'#cfe0f3'}}}}});
-  $('#tSnow').innerHTML='<tr><th>日付</th><th>降雪≥0.5cm</th><th>積雪≥1cm</th><th>≥5cm</th><th>≥10cm</th></tr>'+
+    {label:'降雪量(cm/日)',data:D.map(d=>d.cm),backgroundColor:'rgba(159,211,255,.75)',borderRadius:4},
+    {label:'最大積雪(cm)',data:D.map(d=>d.dmax),backgroundColor:'rgba(242,247,255,.6)',borderRadius:4}]},
+    options:{maintainAspectRatio:false,scales:{y:{beginAtZero:true,grid:{color:GRID}},x:{grid:{display:false},ticks:{maxTicksLimit:6}}},plugins:{legend:{labels:{boxWidth:10,usePointStyle:true}}}}});
+  $('#tSnow').innerHTML='<tr><th>日付</th><th>降雪0.5cm以上</th><th>積雪1cm以上</th><th>5cm以上</th><th>10cm以上</th></tr>'+
     D.map(d=>`<tr><td>${dl(d.date)}</td><td>${pct(d.p)}</td><td>${pct(d.d1)}</td><td>${pct(d.d5)}</td><td>${pct(d.d10)}</td></tr>`).join('');
-  const M=f.models.filter(m=>m.kind!='error');
+}
+function drawModel(){
+  const D=FC.daily, M=FC.models.filter(m=>m.kind!='error'), H72=FC.hourly.filter(h=>h.p!=null).slice(0,72);
   $('#tModel').innerHTML='<tr><th>モデル</th><th>重み</th>'+D.map(d=>`<th>${dl(d.date).replace(/\(.*/,'')}</th>`).join('')+'</tr>'+
-    '<tr><td><b>SNOW CAST 統合</b></td><td>-</td>'+D.map(d=>`<td style="background:${pc(d.p||0)};color:#fff">${pct(d.p)}</td>`).join('')+'</tr>'+
+    '<tr><td><b>SNOW CAST 統合</b></td><td>-</td>'+D.map(d=>`<td style="background:${heat(d.p||0)};color:#fff">${pct(d.p)}</td>`).join('')+'</tr>'+
     M.map(m=>`<tr><td>${m.label}<span class="tag">${m.kind=='ens'?m.members+'メンバー':'確定論'}</span></td><td>${m.weight}</td>`+
-      D.map(d=>{const v=d.by[m.key];return `<td style="background:${v==null?'transparent':pc(v)}">${v==null?'':pct(v)}</td>`}).join('')+'</tr>').join('')+
-    f.models.filter(m=>m.kind=='error').map(m=>`<tr><td class="err" colspan="${D.length+2}">取得失敗: ${m.label}</td></tr>`).join('');
-  const H72=H.slice(0,72);
+      D.map(d=>{const v=d.by[m.key];return `<td style="background:${v==null?'transparent':heat(v)}">${v==null?'':pct(v)}</td>`}).join('')+'</tr>').join('')+
+    FC.models.filter(m=>m.kind=='error').map(m=>`<tr><td class="err" colspan="${D.length+2}">取得失敗: ${m.label}</td></tr>`).join('');
   mk('#cModel',{type:'line',data:{labels:H72.map(h=>hh(h.time)),datasets:[
     ...M.map((m,i)=>({label:m.label,data:H72.map(h=>h.by[m.key]==null?null:h.by[m.key]*100),borderColor:COLORS[i%8],pointRadius:0,borderWidth:1.5,tension:.2})),
     {label:'統合',data:H72.map(h=>h.p*100),borderColor:'#fff',borderWidth:3,pointRadius:0}]},
-    options:{maintainAspectRatio:false,scales:{y:{min:0,max:100,grid:{color:'#223a57'}},x:{ticks:{maxTicksLimit:10,color:'#8fa8c4'}}},plugins:{legend:{labels:{color:'#cfe0f3',boxWidth:12}}}}});
+    options:{maintainAspectRatio:false,scales:{y:{min:0,max:100,grid:{color:GRID},ticks:{callback:v=>v+'%'}},x:{grid:{display:false},ticks:{maxTicksLimit:6}}},plugins:{legend:{labels:{boxWidth:10,usePointStyle:true}}}}});
 }
-
 async function loadVer(){
   const v=await fetch('/api/verification?days=30').then(r=>r.json());
   const src=Object.entries(v.obs_source||{}).map(([k,c])=>k+':'+c).join(' / ')||'実測なし';
-  $('#ver').textContent='過去30日 / 実測の雪判定ソース: '+src+'（proxy=気温・降水による代理指標、手動登録は /api/observe）';
-  const rows=[];
-  const add=(name,o)=>{for(const [b,m] of Object.entries(o||{})) if(m) rows.push(`<tr><td>${name}</td><td>${b}</td><td>${m.n}</td><td>${m.events}</td><td>${m.brier}</td><td>${m.bss??'-'}</td><td>${pct(m.pod)}</td><td>${pct(m.far)}</td></tr>`)};
+  $('#ver').textContent='過去30日。実測の雪判定: '+src+'（proxy=気温・降水からの代理判定、目視の登録は /api/observe）。BSSが0より大きいほど、平年並みの予想より良好です。';
+  const rows=[], add=(name,o)=>{for(const [b,m] of Object.entries(o||{})) if(m) rows.push(`<tr><td>${name}</td><td>${b}</td><td>${m.n}</td><td>${m.events}</td><td>${m.brier}</td><td>${m.bss??'-'}</td><td>${pct(m.pod)}</td><td>${pct(m.far)}</td></tr>`)};
   const hasCal=Object.keys(v.final_cal||{}).length>0;
-  if(hasCal) add('<b>SNOW CAST 統合（補正後）</b>',v.final_cal);
-  add(hasCal?'SNOW CAST 統合（補正前）':'<b>SNOW CAST 統合</b>',v.final);
+  if(hasCal) add('<b>統合（補正後）</b>',v.final_cal);
+  add(hasCal?'統合（補正前）':'<b>統合</b>',v.final);
   for(const [k,o] of Object.entries(v.by_model||{})) add(k,o);
-  const rel=(v.reliability||[]), raw=Object.fromEntries((v.reliability_raw||[]).map(x=>[x.bin,x]));
-  $('#tRel').innerHTML=rel.length?'<tr><th>予報確率帯</th><th>件数</th><th>実際の雪の割合</th>'+(hasCal?'<th>補正前:件数</th><th>補正前:雪の割合</th>':'')+'</tr>'+
+  const rel=v.reliability||[], raw=Object.fromEntries((v.reliability_raw||[]).map(x=>[x.bin,x]));
+  $('#tRel').innerHTML=rel.length?'<tr><th>予報確率</th><th>件数</th><th>実際の雪</th>'+(hasCal?'<th>補正前:件数</th><th>補正前:雪</th>':'')+'</tr>'+
     rel.map(x=>`<tr><td>${x.bin}</td><td>${x.n}</td><td>${pct(x.obs_rate)}</td>`+(hasCal?`<td>${raw[x.bin]?raw[x.bin].n:'-'}</td><td>${raw[x.bin]?pct(raw[x.bin].obs_rate):'-'}</td>`:'')+'</tr>').join(''):'';
-  $('#tVer').innerHTML=rows.length?'<tr><th>系統</th><th>リード</th><th>件数</th><th>雪回数</th><th>Brier</th><th>BSS</th><th>検出率</th><th>空振り率</th></tr>'+rows.join(''):
-    '<tr><td>まだ照合できる記録がありません。予報は6時間ごとに自動記録され、実測と突き合わせて蓄積されます。</td></tr>';
+  $('#tVer').innerHTML=rows.length?'<tr><th>系統</th><th>先の時間</th><th>件数</th><th>雪の回数</th><th>Brier</th><th>BSS</th><th>検出率</th><th>空振り率</th></tr>'+rows.join(''):
+    '<tr><td>照合できる記録がまだありません。予報は6時間ごとに自動記録され、実測と突き合わせて蓄積されます。</td></tr>';
 }
 async function loadObs(){
   const o=await fetch('/api/observations?hours=36').then(r=>r.json());
@@ -1389,9 +1470,34 @@ async function loadObs(){
   $('#tObs').innerHTML='<tr><th>時刻</th><th>気温</th><th>湿度</th><th>降水1h</th><th>積雪深</th><th>雪判定</th></tr>'+
    R.map(x=>`<tr><td>${hh(x.time)}</td><td>${x.temp??'-'}</td><td>${x.rh??'-'}</td><td>${x.precip??'-'}</td><td>${x.snow_depth??'-'}</td><td>${x.snow_flag==null?'-':(x.snow_flag?'雪':'なし')}<span class="tag">${x.flag_src||''}</span></td></tr>`).join('');
 }
+
+/* ---------- タブ・操作 ---------- */
+function draw(){
+  if(!FC) return;
+  if(TAB=='fc') drawFc(); else if(TAB=='snow') drawSnow(); else if(TAB=='model') drawModel();
+  else if(TAB=='ver' && !VERLOADED){VERLOADED=true; loadVer().catch(()=>{$('#ver').textContent='検証データを取得できませんでした。しばらくしてから再度開いてください。';VERLOADED=false;}); loadObs().catch(()=>{});}
+}
+function setTab(t){
+  TAB=t;
+  document.querySelectorAll('.tab').forEach(b=>b.setAttribute('aria-selected',b.dataset.tab==t));
+  document.querySelectorAll('section').forEach(s=>s.classList.toggle('on',s.id=='s-'+t));
+  history.replaceState(null,'','#'+t); draw();
+}
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>setTab(b.dataset.tab));
 document.querySelectorAll('[data-r]').forEach(b=>b.onclick=()=>{
-  document.querySelectorAll('[data-r]').forEach(x=>x.classList.remove('on'));b.classList.add('on');RANGE=+b.dataset.r;drawHour();});
-function showErr(m){const g=$('#gen');g.textContent='';const e=document.createElement('span');e.className='err';e.textContent=m;g.appendChild(e);}
+  document.querySelectorAll('[data-r]').forEach(x=>x.classList.remove('on'));b.classList.add('on');RANGE=+b.dataset.r;if(FC)drawHour();});
+
+async function loadForecast(force){
+  const b=$('#btnRefresh'); b.disabled=true; b.textContent=force?'更新中…':'更新';
+  try{
+    const j=await fetch('/api/forecast'+(force?'?refresh=1':'')).then(r=>r.json());
+    if(j.error){ if(!FC) showErr('取得エラー: '+j.error); return; }
+    FC=j; drawHero(); draw();
+  }catch(e){ if(!FC) showErr(String(e)); }
+  finally{ b.disabled=false; b.textContent='更新'; }
+}
+$('#btnRefresh').onclick=()=>loadForecast(true);
+
 const tok=()=>sessionStorage.getItem('adm')||'';
 async function trainReq(){
   const h={}; if(tok()) h['X-Admin-Token']=tok();
@@ -1415,23 +1521,16 @@ function fmtTrain(r){
 }
 $('#btnTrain').onclick=async()=>{
   const b=$('#btnTrain'); b.disabled=true; $('#trainRes').textContent='実行中…';
-  try{ $('#trainRes').textContent=fmtTrain(await trainReq()); loadVer().catch(()=>{}); setTimeout(loadForecast,30000); }
+  try{ $('#trainRes').textContent=fmtTrain(await trainReq()); VERLOADED=false; loadVer().catch(()=>{}); setTimeout(()=>loadForecast(false),30000); }
   catch(e){ $('#trainRes').textContent='失敗: '+e.message; }
   finally{ b.disabled=false; }
 };
-async function loadForecast(){
-  try{
-    const j=await fetch('/api/forecast').then(r=>r.json());
-    if(j.error){ if(!FC) showErr('取得エラー: '+j.error); return; }
-    FC=j; render();
-  }catch(e){ if(!FC) showErr(String(e)); }
-}
 
 (async()=>{
-  await loadForecast();
-  loadVer().catch(()=>{$('#ver').textContent='検証データを取得できませんでした';});
-  loadObs().catch(()=>{});
-  setInterval(loadForecast, 30*60*1000);
+  const h=location.hash.slice(1); if(['fc','snow','model','ver'].includes(h)) TAB=h;
+  await loadForecast(false);
+  setTab(TAB);
+  setInterval(()=>loadForecast(false), 30*60*1000);
 })();
 </script>
 </body></html>
