@@ -2,7 +2,7 @@
 
   1) 前回のDB(snowcast.sqlite.gz)を復元
   2) アメダス実測の取り込み → 1日1回の再学習 → 予報の再計算（スナップショット保存も app.py と同じ）
-  3) site/ に index.html と data/*.json を出力 → GitHub Pages で公開
+  3) site/ に index.html と data/*.json（forecast / verification / observations / trend / daily）を出力 → GitHub Pages で公開
   4) DBを snowcast.sqlite.gz に固めて返す（ワークフローが専用ブランチへ保存）
 
 app.py は変更不要。Render 版と同じ計算ロジックをそのまま使う。
@@ -30,6 +30,7 @@ def static_html(src):
         ("fetch('/api/verification?days=30')", "fetch('data/verification.json?'+Date.now())"),
         ("fetch('/api/observations?hours=36')", "fetch('data/observations.json?'+Date.now())"),
         ("fetch('/api/trend')", "fetch('data/trend.json?'+Date.now())"),
+        ("fetch('/api/daily?days=60')", "fetch('data/daily.json?'+Date.now())"),
         ("fetch('/api/forecast'+(force?'?refresh=1':''))", "fetch('data/forecast.json?'+Date.now())"),
     ]
     for old, new in pairs:
@@ -83,9 +84,10 @@ def main(patch=None):
         obs = [dict(x) for x in con.execute("SELECT * FROM obs WHERE time>=? ORDER BY time", (since,))]
     ver = A.verification(30)
     trend = A.forecast_trend()
+    daily = A.daily_results(60)       # 予想バトルの判定用（日ごとの実況まとめ）
 
     os.makedirs(os.path.join(SITE, "data"), exist_ok=True)
-    for name, obj in (("forecast", fc), ("verification", ver), ("observations", {"rows": obs}), ("trend", trend)):
+    for name, obj in (("forecast", fc), ("verification", ver), ("observations", {"rows": obs}), ("trend", trend), ("daily", daily)):
         with open(os.path.join(SITE, "data", name + ".json"), "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
     with open(os.path.join(SITE, "index.html"), "w", encoding="utf-8") as f:
