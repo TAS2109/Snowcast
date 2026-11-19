@@ -7,7 +7,11 @@ SNOW CAST  -  複数予報モデル統合による降雪確率サイト (Python 
 データ源
   - 予報モデル : Open-Meteo API 経由で 気象庁MSM・GSM / ECMWF / NOAA GFS / DWD ICON
   - アンサンブル: GEPS(gem_global) / ECMWF-ENS / GEFS（全メンバーを個別に雪判別）
-  - 実測       : 気象庁 アメダス 甲府(49142)
+  - 実測       : 気象庁 アメダス 甲府(49142) ＋ 周辺アメダス（雪の観測・積雪深・風・日照）
+  - 追加の予報元: UKMO / Météo-France / カナダGDPS / CMA / KMA、MET Norway（Open-Meteoを経由しない独立系）
+  - 追加アンサンブル: ICON-EPS / ECMWF AIFS-ENS / MOGREPS-G
+  - 公式       : 気象庁 府県予報（天気・降水確率・気温・週間）と警報・注意報（大雪・風雪・なだれ・着雪など）
+  - 追加の要素 : 風速・雲量・モデル降雪量・0℃高度（確定論モデルのみ。表示用で、雪判別の計算には使わない）
 
 独自雪判別エンジン
   湿球温度を主軸に、850hPa気温・地上気温・降水量でロジスティック判別
@@ -24,6 +28,7 @@ SNOW CAST  -  複数予報モデル統合による降雪確率サイト (Python 
          threads を増やすと、予報取得中でも /health や画面が固まらない。
 環境変数: SNOWCAST_DB (DBパス), SNOWCAST_BG=0 (バックグラウンド処理を無効化), PORT
     SNOWCAST_OPENMETEO_KEY Open-Meteo 有料プランのAPIキー(任意)
+    SNOWCAST_UA            MET Norway 用の User-Agent（連絡先入り推奨）。例 "snowcast/1.0 you@example.com"
     SNOWCAST_ADMIN_TOKEN   設定すると /api/retrain と /api/observe にトークンが必要になる
                            (ヘッダ X-Admin-Token または ?token=)。公開URLで運用するなら設定推奨
   Render無料プラン対策（永続ディスクなしでも検証データを残す）:
@@ -32,9 +37,6 @@ SNOW CAST  -  複数予報モデル統合による降雪確率サイト (Python 
     SNOWCAST_BACKUP_BRANCH (既定 snowcast-data) / SNOWCAST_BACKUP_H (既定 6 時間ごと)
     SNOWCAST_KEEP_DAYS     (既定 120) 記録保持日数。バックアップを軽くしたいときは 60 など
     RENDER_EXTERNAL_URL    Renderが自動設定。あれば10分おきに自分の /health を叩きスリープを防ぐ
-予想バトル（降る/降らないを予想して勝負）
-  - 判定用に /api/daily（日ごとの実況まとめ）を提供。予想の保存・ランキングは各ブラウザ側(localStorage)で行い、
-    友達とはリンク(#play=...)で共有する。サーバーに個人データは保存しない
 依存: flask (標準ライブラリのみ他に不要)
 """
 import atexit
@@ -67,6 +69,9 @@ LOCATION = {
     "lon": 138.5683,
     "elev": 272,
     "amedas": "49142",  # アメダス 甲府
+    "jma_office": "190000",   # 気象庁 府県予報区（山梨県）
+    "jma_area": "190010",     # 一次細分区域（中・西部）
+    "jma_city": "1920100",    # 警報・注意報の対象市（甲府市）
 }
 HORIZON_DAYS = 11
 HORIZON_H = HORIZON_DAYS * 24
@@ -78,12 +83,27 @@ DET_MODELS = [
     ("ecmwf_ifs025", "ECMWF IFS"),
     ("gfs_seamless", "NOAA GFS"),
     ("icon_seamless", "DWD ICON"),
+    ("ukmo_seamless", "英国 UKMO"),
+    ("meteofrance_seamless", "仏 ARPEGE"),
+    ("gem_seamless", "カナダ GDPS"),
+    ("cma_grapes_global", "中国 CMA"),
+    ("kma_seamless", "韓国 KMA"),
+    ("metno", "MET Norway"),          # Open-Meteoを経由しない独立系（fetch_metno）
 ]
 ENS_MODELS = [
     ("gem_global", "GEPS (カナダ)"),
     ("ecmwf_ifs025", "ECMWF-ENS"),
     ("gfs025", "GEFS (NOAA)"),
+    ("icon_seamless", "ICON-EPS (DWD)"),
+    ("ecmwf_aifs025", "ECMWF AIFS-ENS"),
+    ("ukmo_global_ensemble_20km", "MOGREPS-G (UKMO)"),
 ]
+# 実績がまだ無い新モデルの初期重み（検証データが溜まると再学習で置き換わる）
+DEFAULT_W = {"cma_grapes_global": 0.6, "kma_seamless": 0.6, "gem_seamless": 0.8, "metno": 0.8,
+             "meteofrance_seamless": 0.8, "ukmo_seamless": 0.9, "ens_icon_seamless": 0.9,
+             "ens_ecmwf_aifs025": 0.8, "ens_ukmo_global_ensemble_20km": 0.8}
+VARIANTS_ON = os.environ.get("SNOWCAST_VARIANTS", "1") != "0"   # 0 で計算パターンの生成を止める（軽くしたいとき）
+DET_VARS_EXTRA = ["wind_speed_10m", "cloud_cover", "snowfall", "freezing_level_height"]   # 表示用
 DET_VARS_FULL = ["temperature_2m", "relative_humidity_2m", "precipitation",
                  "pressure_msl", "temperature_850hPa"]
 DET_VARS_CORE = ["temperature_2m", "relative_humidity_2m", "precipitation",
@@ -106,6 +126,8 @@ BACKUP_BRANCH = os.environ.get("SNOWCAST_BACKUP_BRANCH", "snowcast-data")
 BACKUP_FILE = "snowcast.sqlite.gz"
 ADMIN_TOKEN = os.environ.get("SNOWCAST_ADMIN_TOKEN", "")
 OM_KEY = os.environ.get("SNOWCAST_OPENMETEO_KEY", "")   # Open-Meteo 有料プランのAPIキー(任意)。設定すると上限の影響を受けにくい
+UA = os.environ.get("SNOWCAST_UA", "SNOWCAST/1.0 (github.com/snowcast)")
+LIVE_TTL = 600                # 公式予報・警報・周辺アメダスの再利用秒数
 SRC_TTL = 3 * 3600            # 各予報モデルの取得結果を再利用する時間（モデル自体の更新は6時間おき程度）
 SRC_FALLBACK_MAX = 18 * 3600  # 取得に失敗したとき、この時間内の前回結果なら代わりに使う
 FRESH_MIN_INTERVAL = 600      # 「更新」ボタンで再取得を許す最短間隔(秒)
@@ -130,6 +152,11 @@ _src_lock = threading.Lock()
 _blocked = {}       # ホスト名 -> 上限解除の時刻(epoch)
 _last_fresh = [0.0]
 _train_lock = threading.Lock()
+_live_lock = threading.Lock()
+_live = {"time": 0, "data": None}
+_variants = {"data": None}    # 計算方法×データソースの組み合わせ結果（「パターン」タブ用）
+_members = {"data": None}     # メンバー別の計算結果（最新の予報計算で更新。画面の「メンバー」タブ用）
+_amedas_sel = {"time": 0, "sel": None}
 _refreshing = threading.Event()
 
 
@@ -153,7 +180,7 @@ def _next_utc_midnight():
     return (n.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).timestamp()
 
 
-def http_get(url, params=None, timeout=25, retries=2):
+def http_get(url, params=None, timeout=25, retries=2, ua=None):
     if params:
         url = url + "?" + urlparse.urlencode(params)
     host = urlparse.urlparse(url).netloc
@@ -162,7 +189,7 @@ def http_get(url, params=None, timeout=25, retries=2):
     last = None
     for k in range(retries + 1):
         try:
-            req = urlrequest.Request(url, headers={"User-Agent": "SNOWCAST/1.0"})
+            req = urlrequest.Request(url, headers={"User-Agent": ua or "SNOWCAST/1.0"})
             with urlrequest.urlopen(req, timeout=timeout) as r:
                 return r.read().decode("utf-8")
         except urlerror.HTTPError as e:
@@ -320,7 +347,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS obs(
             time TEXT PRIMARY KEY, temp REAL, rh REAL, precip REAL,
             snow_depth REAL, snow1h REAL, pressure REAL,
-            snow_flag INTEGER, flag_src TEXT);
+            snow_flag INTEGER, flag_src TEXT, wind REAL, sun1h REAL);
         CREATE TABLE IF NOT EXISTS params(key TEXT PRIMARY KEY, value REAL);
         CREATE TABLE IF NOT EXISTS weights(
             model TEXT PRIMARY KEY, w REAL, n INTEGER, brier REAL, updated TEXT);
@@ -329,6 +356,10 @@ def init_db():
         CREATE INDEX IF NOT EXISTS ix_fc_target ON fc_snap(target);
         CREATE INDEX IF NOT EXISTS ix_final_target ON final_snap(target);
         """)
+        have = {x[1] for x in con.execute("PRAGMA table_info(obs)")}     # 既存DBに列を追加
+        for col in ("wind", "sun1h"):
+            if col not in have:
+                con.execute("ALTER TABLE obs ADD COLUMN %s REAL" % col)
 
 
 def get_params():
@@ -533,7 +564,7 @@ def _base_params():
     p = {
         "latitude": LOCATION["lat"], "longitude": LOCATION["lon"],
         "elevation": LOCATION["elev"], "timezone": "Asia/Tokyo",
-        "forecast_days": HORIZON_DAYS + 1,
+        "forecast_days": HORIZON_DAYS + 1, "wind_speed_unit": "ms",
     }
     if OM_KEY:
         p["apikey"] = OM_KEY
@@ -549,7 +580,8 @@ def _om_host(kind):
 def fetch_det(model):
     url = _om_host("det")
     last = None
-    for vars_, minimal in ((DET_VARS_FULL, False), (DET_VARS_CORE, False), (DET_VARS_CORE, True)):
+    for vars_, minimal in ((DET_VARS_FULL + DET_VARS_EXTRA, False), (DET_VARS_FULL, False),
+                           (DET_VARS_CORE, False), (DET_VARS_CORE, True)):
         try:
             p = _base_params()
             if minimal:
@@ -558,7 +590,7 @@ def fetch_det(model):
             p.update({"models": model, "hourly": ",".join(vars_)})
             js = http_json(url, p)
             h = js["hourly"]
-            out = {"time": h["time"]}
+            out = {"time": h["time"], "grid": {"lat": js.get("latitude"), "lon": js.get("longitude")}}
             for v in vars_:
                 out[v] = h.get(v) or h.get(f"{v}_{model}")
             if not out.get("temperature_2m") or all(x is None for x in out["temperature_2m"]):
@@ -591,7 +623,7 @@ def _parse_ens(js):
                 members.append(m)
     if not members:
         raise ValueError("no members")
-    return {"time": h["time"], "members": members}
+    return {"time": h["time"], "members": members, "grid": {"lat": js.get("latitude"), "lon": js.get("longitude")}}
 
 
 def fetch_ens(model):
@@ -629,12 +661,234 @@ def _cached_fetch(kind, key, fn, fresh=False):
     return data
 
 
+def fetch_metno(_key=None):
+    """MET Norway Locationforecast。Open-Meteo を経由しない独立した予報元（1時間値＋後半は6時間値を補間）。"""
+    js = http_json("https://api.met.no/weatherapi/locationforecast/2.0/compact",
+                   {"lat": round(LOCATION["lat"], 4), "lon": round(LOCATION["lon"], 4),
+                    "altitude": int(LOCATION["elev"])}, ua=UA, timeout=25, retries=1)
+    pts = []
+    for e in js["properties"]["timeseries"]:
+        t = datetime.fromisoformat(e["time"].replace("Z", "+00:00")).astimezone(JST).replace(minute=0, second=0, microsecond=0)
+        d = e["data"]
+        det = d["instant"]["details"]
+        p1 = ((d.get("next_1_hours") or {}).get("details") or {}).get("precipitation_amount")
+        p6 = ((d.get("next_6_hours") or {}).get("details") or {}).get("precipitation_amount")
+        pts.append((t, det.get("air_temperature"), det.get("relative_humidity"), det.get("air_pressure_at_sea_level"),
+                    det.get("wind_speed"), det.get("cloud_area_fraction"), p1, p6))
+    if len(pts) < 2:
+        raise ValueError("no data")
+    out = {k: [] for k in ("time", "temperature_2m", "relative_humidity_2m", "pressure_msl",
+                           "wind_speed_10m", "cloud_cover", "precipitation")}
+
+    def lerp(a, b, f):
+        return None if a is None or b is None else a + (b - a) * f
+
+    for k in range(len(pts) - 1):
+        a, b = pts[k], pts[k + 1]
+        gap = max(1, int(round((b[0] - a[0]).total_seconds() / 3600)))
+        for j in range(gap):
+            f = j / gap
+            if gap == 1 and a[6] is not None:
+                pr = a[6]
+            elif a[7] is not None:
+                pr = a[7] / 6.0
+            else:
+                pr = a[6]
+            out["time"].append((a[0] + timedelta(hours=j)).strftime("%Y-%m-%dT%H:00"))
+            out["temperature_2m"].append(lerp(a[1], b[1], f))
+            out["relative_humidity_2m"].append(lerp(a[2], b[2], f))
+            out["pressure_msl"].append(lerp(a[3], b[3], f))
+            out["wind_speed_10m"].append(lerp(a[4], b[4], f))
+            out["cloud_cover"].append(lerp(a[5], b[5], f))
+            out["precipitation"].append(pr)
+    if all(x is None for x in out["temperature_2m"]):
+        raise ValueError("no data")
+    try:
+        c = js["geometry"]["coordinates"]
+        out["grid"] = {"lat": c[1], "lon": c[0]}
+    except Exception:  # noqa
+        pass
+    return out
+
+
+CUSTOM_DET = {"metno": fetch_metno}     # Open-Meteo以外から取る確定論モデル
+
+
+# ----------------------------------------------------------------------------
+# 公式予報・警報・周辺アメダス（雪判別の計算には使わず、実況・参考情報として表示）
+# ----------------------------------------------------------------------------
+JMA = "https://www.jma.go.jp/bosai"
+WARN_NAMES = {"02": "暴風雪警報", "03": "大雨警報", "04": "洪水警報", "05": "暴風警報", "06": "大雪警報",
+              "07": "波浪警報", "08": "高潮警報", "10": "大雨注意報", "12": "大雪注意報", "13": "風雪注意報",
+              "14": "雷注意報", "15": "強風注意報", "16": "波浪注意報", "17": "融雪注意報", "18": "洪水注意報",
+              "19": "高潮注意報", "20": "濃霧注意報", "21": "乾燥注意報", "22": "なだれ注意報", "23": "低温注意報",
+              "24": "霜注意報", "25": "着氷注意報", "26": "着雪注意報", "27": "その他の注意報",
+              "32": "暴風雪特別警報", "33": "大雨特別警報", "35": "暴風特別警報", "36": "大雪特別警報"}
+SNOW_WARN = {"02", "06", "12", "13", "17", "22", "23", "25", "26", "32", "36"}
+
+
+def _area(areas, code, strict=False):
+    for a in areas or []:
+        if str((a.get("area") or {}).get("code")) == str(code):
+            return a
+    return None if strict or not areas else areas[0]
+
+
+def _parse_jma_forecast(data):
+    res = {"report": (data[0].get("reportDatetime") or "")[:16]}
+    ts = data[0]["timeSeries"]
+    a0 = _area(ts[0]["areas"], LOCATION["jma_area"])
+    res["area_name"] = (a0.get("area") or {}).get("name", "")
+    short = {"weather": [{"date": t[:10], "text": (w or "").replace("\u3000", " ")}
+                         for t, w in zip(ts[0]["timeDefines"], a0.get("weathers", []))], "pops": [], "temps": []}
+    if len(ts) > 1:
+        a1 = _area(ts[1]["areas"], LOCATION["jma_area"])
+        short["pops"] = [{"time": t[:16], "pop": p} for t, p in zip(ts[1]["timeDefines"], (a1 or {}).get("pops", []))]
+    if len(ts) > 2:
+        a2 = _area(ts[2]["areas"], LOCATION["amedas"], strict=True)
+        short["temps"] = [{"time": t[:16], "temp": v} for t, v in zip(ts[2]["timeDefines"], (a2 or {}).get("temps", []))]
+    res["short"] = short
+    week = []
+    if len(data) > 1:
+        wts = data[1]["timeSeries"]
+        wa = _area(wts[0]["areas"], LOCATION["jma_office"])
+        ta = _area(wts[1]["areas"], LOCATION["amedas"], strict=True) if len(wts) > 1 else None
+        for i, t in enumerate(wts[0]["timeDefines"]):
+            def at(src, key):
+                v = (src or {}).get(key) or []
+                return v[i] if i < len(v) else ""
+            week.append({"date": t[:10], "pop": at(wa, "pops"), "rel": at(wa, "reliabilities"),
+                         "tmin": at(ta, "tempsMin"), "tmax": at(ta, "tempsMax")})
+    res["week"] = week
+    return res
+
+
+def _parse_jma_warning(js):
+    items, seen, found = [], set(), False
+    for code in (LOCATION["jma_city"], LOCATION["jma_area"]):
+        for at in js.get("areaTypes", []):
+            for a in at.get("areas", []):
+                if str(a.get("code")) != code:
+                    continue
+                found = True
+                for w in a.get("warnings", []):
+                    c = str(w.get("code", ""))
+                    if not c or w.get("status", "") in ("解除", "発表警報・注意報はなし") or c in seen:
+                        continue
+                    seen.add(c)
+                    items.append({"code": c, "name": WARN_NAMES.get(c, "警報・注意報(コード%s)" % c),
+                                  "status": w.get("status", ""), "snow": c in SNOW_WARN})
+        if found:
+            break
+    return {"report": (js.get("reportDatetime") or "")[:16], "items": items, "found": found}
+
+
+def fetch_official():
+    """気象庁の公式 府県予報 と 警報・注意報。片方が失敗してももう片方は返す。"""
+    out = {"fetched": now_jst().strftime("%Y-%m-%d %H:%M")}
+    off = LOCATION["jma_office"]
+    try:
+        out.update(_parse_jma_forecast(http_json("%s/forecast/data/forecast/%s.json" % (JMA, off), timeout=15, retries=1)))
+    except Exception as e:  # noqa
+        out["forecast_error"] = str(e)[:160]
+    try:
+        out["warnings"] = _parse_jma_warning(http_json("%s/warning/data/warning/%s.json" % (JMA, off), timeout=15, retries=1))
+    except Exception as e:  # noqa
+        out["warning_error"] = str(e)[:160]
+    return out
+
+
+def _hav(lat1, lon1, lat2, lon2):
+    p = math.pi / 180
+    a = (math.sin((lat2 - lat1) * p / 2) ** 2
+         + math.cos(lat1 * p) * math.cos(lat2 * p) * math.sin((lon2 - lon1) * p / 2) ** 2)
+    return 12742 * math.asin(math.sqrt(a))
+
+
+def amedas_neighbors(radius=50, k=10):
+    """周辺アメダス地点（観測所一覧から距離で選ぶ。7日キャッシュ）。"""
+    if _amedas_sel["sel"] is not None and time.time() - _amedas_sel["time"] < 7 * 86400:
+        return _amedas_sel["sel"]
+    tbl = http_json(JMA + "/amedas/const/amedastable.json", timeout=20, retries=1)
+    sel = []
+    for code, st in tbl.items():
+        if code == LOCATION["amedas"]:
+            continue
+        try:
+            d = _hav(LOCATION["lat"], LOCATION["lon"], st["lat"][0] + st["lat"][1] / 60, st["lon"][0] + st["lon"][1] / 60)
+        except Exception:  # noqa
+            continue
+        if d <= radius:
+            sel.append({"code": code, "name": st.get("kjName") or st.get("enName") or code,
+                        "dist": round(d, 1), "alt": st.get("alt"),
+                        "lat": round(st["lat"][0] + st["lat"][1] / 60, 5), "lon": round(st["lon"][0] + st["lon"][1] / 60, 5)})
+    sel.sort(key=lambda x: x["dist"])
+    sel = sel[:k]
+    _amedas_sel.update(time=time.time(), sel=sel)
+    return sel
+
+
+def _amedas_row(code, name, dist, alt, rec, self_=False, lat=None, lon=None):
+    temp, rh = _v(rec, "temp"), _v(rec, "humidity")
+    p10, p1 = _v(rec, "precipitation10m"), _v(rec, "precipitation1h")
+    depth, s1 = _v(rec, "snow"), _v(rec, "snow1h")
+    pr = p10 if p10 is not None else p1
+    if s1 is not None:
+        snow, basis = (1 if s1 > 0 else 0), "実測"
+    elif pr is not None and temp is not None:
+        snow, basis = (1 if (pr > 0 and temp <= 0.5) else 0), "推定"
+    else:
+        snow, basis = None, ""
+    return {"code": code, "name": name, "dist": dist, "alt": alt, "lat": lat, "lon": lon, "self": self_, "temp": temp, "rh": rh,
+            "precip1h": p1, "snow_depth": depth, "snow1h": s1, "wind": _v(rec, "wind"),
+            "sun1h": _v(rec, "sun1h"), "snow": snow, "basis": basis}
+
+
+def fetch_nearby():
+    """甲府と周辺アメダスの最新10分値（全国1ファイルの一括データから抜き出す）。"""
+    base = JMA + "/amedas/data"
+    latest = http_get(base + "/latest_time.txt", timeout=15, retries=1).strip()
+    dt = datetime.fromisoformat(latest)
+    snap = http_json("%s/map/%s.json" % (base, dt.strftime("%Y%m%d%H%M%S")), timeout=25, retries=1)
+    rows = []
+    me = snap.get(LOCATION["amedas"])
+    if me:
+        rows.append(_amedas_row(LOCATION["amedas"], LOCATION["name"] + "（自地点）", 0, LOCATION["elev"], me, True, LOCATION["lat"], LOCATION["lon"]))
+    for st in amedas_neighbors():
+        rec = snap.get(st["code"])
+        if rec:
+            rows.append(_amedas_row(st["code"], st["name"], st["dist"], st["alt"], rec, False, st.get("lat"), st.get("lon")))
+    nb = [x for x in rows if not x["self"]]
+    return {"time": dt.strftime("%Y-%m-%dT%H:%M"), "rows": rows,
+            "summary": {"stations": len(nb), "snowing": sum(1 for x in nb if x["snow"] == 1),
+                        "with_depth": sum(1 for x in nb if (x["snow_depth"] or 0) > 0),
+                        "max_depth": max([x["snow_depth"] or 0 for x in nb], default=0)}}
+
+
+def get_live(force=False):
+    """公式予報・警報・周辺アメダスをまとめて返す（LIVE_TTL秒キャッシュ。失敗時は前回分を古い印つきで返す）。"""
+    with _live_lock:
+        if _live["data"] and not force and time.time() - _live["time"] < LIVE_TTL:
+            return _live["data"]
+        prev = _live["data"] or {}
+        out = {"generated_at": now_jst().strftime("%Y-%m-%d %H:%M")}
+        for key, fn in (("official", fetch_official), ("nearby", fetch_nearby)):
+            try:
+                out[key] = fn()
+            except Exception as e:  # noqa
+                log.warning("live %s failed: %s", key, e)
+                out[key] = dict(prev[key], stale=True) if isinstance(prev.get(key), dict) and "error" not in prev[key] \
+                    else {"error": str(e)[:200]}
+        _live.update(time=time.time(), data=out)
+        return out
+
+
 def fetch_all(fresh=False):
     det, ens, errors = {}, {}, {}
     jobs = []
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         for key, _ in DET_MODELS:
-            jobs.append(("det", key, ex.submit(_cached_fetch, "det", key, fetch_det, fresh)))
+            jobs.append(("det", key, ex.submit(_cached_fetch, "det", key, CUSTOM_DET.get(key, fetch_det), fresh)))
         for key, _ in ENS_MODELS:
             jobs.append(("ens", key, ex.submit(_cached_fetch, "ens", key, fetch_ens, fresh)))
         for kind, key, fut in jobs:
@@ -649,6 +903,149 @@ def fetch_all(fresh=False):
 # ----------------------------------------------------------------------------
 # 統合
 # ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# 計算パターン（雪判別の方法 × データソースの組み合わせ）
+# ----------------------------------------------------------------------------
+VARIANT_METHODS = [   # (key, 名前, 短い名前, 説明)
+    ("tw", "湿球温度（学習済み）", "湿球", "現行の判別。湿球温度と850hPa気温、地上気温のロジスティック判別"),
+    ("tw0", "湿球温度のみ", "湿球(850なし)", "850hPa気温を使わず、湿球温度と地上気温だけで判別"),
+    ("tw_lo", "湿球温度（雨寄り）", "湿球(雨寄り)", "湿球温度のしきい値を0.5℃下げる（雨・みぞれになりやすい側）"),
+    ("tw_hi", "湿球温度（雪寄り）", "湿球(雪寄り)", "湿球温度のしきい値を0.5℃上げる（雪になりやすい側）"),
+    ("t2", "地上気温のみ", "地上気温", "地上気温1℃付近を境に雨・雪を判別する単純な方法"),
+    ("t850", "850hPa気温主体", "850hPa", "上空の気温で判別。850hPaが無いモデルは湿球温度で代用"),
+    ("frz", "0℃高度", "0℃高度", "0℃高度が低いほど雪。確定論モデルのみ、他は湿球温度で代用"),
+    ("msnow", "モデル降雪量", "モデル降雪", "モデル自身が出す降雪量で判別。確定論モデルのみ、他は湿球温度で代用"),
+]
+VARIANT_SETS = [      # (key, 名前, 短い名前, 説明, 対象モデルの条件, 学習重みを使うか)
+    ("all_w", "全モデル（学習重み）", "全(重み)", "すべての予報モデルを、実測で学習した重みで統合（現行）",
+     lambda s: True, True),
+    ("all_eq", "全モデル（等重み）", "全(等)", "すべての予報モデルを同じ重みで統合", lambda s: True, False),
+    ("det", "確定論のみ", "確定論", "確定論モデル（1本の予報）だけで統合", lambda s: s["kind"] == "det", True),
+    ("ens", "アンサンブルのみ", "アンサンブル", "アンサンブル（多数メンバー）だけで統合", lambda s: s["kind"] == "ens", True),
+    ("jma", "気象庁のみ", "気象庁", "気象庁 MSM・GSM だけ", lambda s: s["key"] in ("jma_msm", "jma_gsm"), False),
+    ("ecmwf", "ECMWF系のみ", "ECMWF", "ECMWF の確定論・ENS・AIFS だけ",
+     lambda s: s["key"] in ("ecmwf_ifs025", "ens_ecmwf_ifs025", "ens_ecmwf_aifs025"), False),
+    ("noaa", "NOAA系のみ", "NOAA", "GFS と GEFS だけ", lambda s: s["key"] in ("gfs_seamless", "ens_gfs025"), False),
+]
+
+
+def p_snow_method(method, w, t2, t850, params, fsnow, frz):
+    """降水があるとき雪である確率を、方法ごとに求める。必要なデータが無ければ現行方式(tw)で代用。"""
+    thr, scale = params["thr"], params["scale"]
+    if method == "tw0":
+        return p_snow_given_precip(w, t2, None, thr, scale)
+    if method == "tw_lo":
+        return p_snow_given_precip(w, t2, t850, thr - 0.5, scale)
+    if method == "tw_hi":
+        return p_snow_given_precip(w, t2, t850, thr + 0.5, scale)
+    if method == "t2":
+        return sigmoid((1.0 - t2) / 0.7)
+    if method == "t850" and t850 is not None:
+        z = (-2.5 - t850) / 1.5
+        if t2 > 4.0:
+            z -= 0.8 * (t2 - 4.0)
+        return sigmoid(z)
+    if method == "frz" and frz is not None:
+        z = (LOCATION["elev"] + 400.0 - frz) / 250.0
+        if t2 > 4.0:
+            z -= 0.8 * (t2 - 4.0)
+        return sigmoid(z)
+    if method == "msnow" and fsnow is not None:
+        return 1.0 - math.exp(-max(0.0, fsnow) / 0.15)
+    return p_snow_given_precip(w, t2, t850, thr, scale)
+
+
+def run_variant(n, mem, method, params, hard):
+    """1メンバーを指定の方法で判別し、(降雪確率, 降雪量cm) を返す。"""
+    tw = mem.get("_tw")
+    if tw is None:
+        tw = mem["_tw"] = [wet_bulb(t, h) if t is not None and h is not None else None
+                           for t, h in zip(mem["temp"], mem["rh"])]
+    a850, fs, fz = mem.get("t850"), mem.get("fsnow"), mem.get("frz")
+    ps, cm = [None] * n, [None] * n
+    for i in range(n):
+        t, p, w = mem["temp"][i], mem["precip"][i], tw[i]
+        if t is None or p is None or w is None:
+            continue
+        pc = p_snow_method(method, w, t, a850[i] if a850 else None, params,
+                           fs[i] if fs else None, fz[i] if fz else None)
+        pp = (1.0 if p >= 0.1 else 0.0) if hard else p_precip_soft(p)
+        ps[i] = pp * pc
+        cm[i] = p * pc * snow_ratio(t) / 10.0
+    return ps, cm
+
+
+def _has_data(method, s):
+    m0 = s["members"][0]
+    if method in ("tw0", "t850"):
+        return any(m.get("t850") for m in s["members"])
+    if method == "frz":
+        return any(x is not None for x in m0.get("frz") or [])
+    if method == "msnow":
+        return any(x is not None for x in m0.get("fsnow") or [])
+    return True
+
+
+def build_variants(srcs, n, T, day_idx, params, calib, hourly, daily):
+    """方法(8) × データソース(7) の組み合わせごとに降雪確率を計算する。"""
+    sel3 = list(range(0, n, 3))
+    days = list(day_idx.keys())
+    cache = {}
+    for mk, _, _, _ in VARIANT_METHODS:
+        for s in srcs:
+            if mk != "tw" and not _has_data(mk, s):
+                cache[(mk, s["key"])] = cache[("tw", s["key"])]     # 差が出ないので使い回す
+                continue
+            hard = s["kind"] == "ens"
+            runs = [run_variant(n, m, mk, params, hard) for m in s["members"]]
+            ps = [mean([rn[0][i] for rn in runs]) for i in range(n)]
+            dd = {}
+            for d, idxs in day_idx.items():
+                tot = []
+                for _, cm in runs:
+                    cms = [cm[i] for i in idxs if cm[i] is not None]
+                    if len(cms) >= max(6, len(idxs) // 2):
+                        tot.append(sum(cms))
+                if tot:
+                    dd[d] = (mean([1.0 if x >= 0.5 else 0.0 for x in tot]) if hard else min(1.0, tot[0] / 0.5), mean(tot))
+            cache[(mk, s["key"])] = (ps, dd)
+    out = {"issue": tstr(hour_floor()), "t": [T[i] for i in sel3], "days": days,
+           "methods": [{"key": k, "label": a, "short": b, "desc": c} for k, a, b, c in VARIANT_METHODS],
+           "sets": [{"key": k, "label": a, "short": b, "desc": c} for k, a, b, c, _, _ in VARIANT_SETS],
+           "variants": [],
+           "base": {"p": [hourly[i].get("p") for i in sel3],
+                    "d": [next((x["p"] for x in daily if x["date"] == d), None) for d in days]}}
+    for mi, (mk, _, _, _) in enumerate(VARIANT_METHODS):
+        for si, (_, _, _, _, pred, use_w) in enumerate(VARIANT_SETS):
+            items = [s for s in srcs if pred(s)]
+            if not items:
+                continue
+            p_h = []
+            for i in sel3:
+                num = den = 0.0
+                for s in items:
+                    v = cache[(mk, s["key"])][0][i]
+                    if v is not None:
+                        w = (s["w"] * lead_factor(s["kind"], i)) if use_w else 1.0
+                        num += w * v
+                        den += w
+                p_h.append(r(calibrate(num / den, i, calib), 3) if den else None)
+            p_d, c_d = [], []
+            for d in days:
+                num = den = cs = 0.0
+                for s in items:
+                    x = cache[(mk, s["key"])][1].get(d)
+                    if x:
+                        w = s["w"] if use_w else 1.0
+                        num += w * x[0]
+                        cs += w * x[1]
+                        den += w
+                p_d.append(r(num / den, 3) if den else None)
+                c_d.append(r(cs / den, 1) if den else None)
+            out["variants"].append({"m": mi, "s": si, "p": p_h, "d": p_d, "c": c_d})
+    return out
+
+
 def build_forecast(det=None, ens=None, errors=None, start=None, fresh=False):
     """予報を取得し、モデル毎に雪判別→統合。(公開JSON, 検証用行, 最終行) を返す。"""
     if det is None and ens is None:
@@ -696,6 +1093,8 @@ def build_forecast(det=None, ens=None, errors=None, start=None, fresh=False):
             "temp": al(tm, r_.get("temperature_2m")), "rh": al(tm, r_.get("relative_humidity_2m")),
             "precip": al(tm, r_.get("precipitation")), "pres": al(tm, r_.get("pressure_msl")),
             "t850": al(tm, r_.get("temperature_850hPa")) if r_.get("temperature_850hPa") else None,
+            "wind": al(tm, r_.get("wind_speed_10m")), "cloud": al(tm, r_.get("cloud_cover")),
+            "fsnow": al(tm, r_.get("snowfall")), "frz": al(tm, r_.get("freezing_level_height")),
         }
         srcs.append({"key": key, "label": label, "kind": "det", "members": [mem]})
     for key, label in ENS_MODELS:
@@ -709,6 +1108,7 @@ def build_forecast(det=None, ens=None, errors=None, start=None, fresh=False):
                 "temp": al(tm, m["temperature_2m"]), "rh": al(tm, m["relative_humidity_2m"]),
                 "precip": al(tm, m["precipitation"]), "pres": al(tm, m.get("pressure_msl")),
                 "t850": al(tm, m["temperature_850hPa"]) if m.get("temperature_850hPa") else None,
+                "wind": [None] * n, "cloud": [None] * n, "fsnow": [None] * n, "frz": [None] * n,
             })
         srcs.append({"key": "ens_" + key, "label": label, "kind": "ens", "members": mems})
 
@@ -721,7 +1121,7 @@ def build_forecast(det=None, ens=None, errors=None, start=None, fresh=False):
         hard = s["kind"] == "ens"
         runs = [run_member(n, m, params, hard, depth0) for m in s["members"]]
         s["runs"] = runs
-        s["w"] = wts.get(s["key"], 1.0)
+        s["w"] = wts.get(s["key"], DEFAULT_W.get(s["key"], 1.0))
 
         def avg(field, runs=runs):
             return [mean([rn[field][i] for rn in runs]) for i in range(n)]
@@ -731,7 +1131,11 @@ def build_forecast(det=None, ens=None, errors=None, start=None, fresh=False):
                   "rh": [mean([m["rh"][i] for m in s["members"]]) for i in range(n)],
                   "precip": [mean([m["precip"][i] for m in s["members"]]) for i in range(n)],
                   "pres": [mean([m["pres"][i] for m in s["members"]]) for i in range(n)],
-                  "t850": [mean([m["t850"][i] for m in s["members"] if m["t850"]]) for i in range(n)]}
+                  "t850": [mean([m["t850"][i] for m in s["members"] if m["t850"]]) for i in range(n)],
+                  "wind": [mean([m["wind"][i] for m in s["members"]]) for i in range(n)],
+                  "cloud": [mean([m["cloud"][i] for m in s["members"]]) for i in range(n)],
+                  "fsnow": [mean([m["fsnow"][i] for m in s["members"]]) for i in range(n)],
+                  "frz": [mean([m["frz"][i] for m in s["members"]]) for i in range(n)]}
         # 日別
         s["days"] = {}
         for d, idxs in day_idx.items():
@@ -755,6 +1159,24 @@ def build_forecast(det=None, ens=None, errors=None, start=None, fresh=False):
                 "d5": mean([1.0 if x >= 5 else 0.0 for x in dmax]),
                 "d10": mean([1.0 if x >= 10 else 0.0 for x in dmax]),
             }
+
+    # メンバー別の結果（「メンバー」タブ用）。3時間ごとに間引いて軽くする
+    sel3 = list(range(0, n, 3))
+    mem_out = {"issue": tstr(start), "t": [T[i] for i in sel3], "days": list(day_idx.keys()), "ps_n": 40, "models": []}
+    for s in srcs:
+        dep, cum, dcm, psl = [], [], [], []
+        for rn in s["runs"]:
+            c, acc = [], 0.0
+            for k in range(n):
+                acc += rn["cm"][k] or 0.0
+                c.append(acc)
+            dep.append([r(rn["depth"][k], 1) for k in sel3])
+            cum.append([r(c[k], 1) for k in sel3])
+            dcm.append([r(sum((rn["cm"][k] or 0.0) for k in idxs), 1) for idxs in day_idx.values()])
+            psl.append([None if rn["ps"][k] is None else int(round(rn["ps"][k] * 100)) for k in sel3[:40]])
+        mem_out["models"].append({"key": s["key"], "label": s["label"], "kind": s["kind"],
+                                  "depth": dep, "cum": cum, "dcm": dcm, "ps": psl})
+    _members["data"] = mem_out
 
     # 時間別の統合
     hourly = []
@@ -795,6 +1217,8 @@ def build_forecast(det=None, ens=None, errors=None, start=None, fresh=False):
             "temp": r(wavg("temp"), 1), "tw": r(wavg("tw"), 1), "precip": r(wavg("precip"), 2),
             "cm": r(wavg("cm"), 2), "depth": r(wavg("depth"), 1),
             "pres": r(pres, 1), "dp6": r(dp6, 1),
+            "wind": r(wavg("wind"), 1), "cloud": r(wavg("cloud"), 0), "frz": r(wavg("frz"), 0),
+            "msnow": r(wavg("fsnow"), 2),
             "by": {s["key"]: r(s["m"]["ps"][i], 3) for s, _ in items},
         })
 
@@ -826,6 +1250,11 @@ def build_forecast(det=None, ens=None, errors=None, start=None, fresh=False):
             "by": {s["key"]: r(x["ex"], 3) for s, x in items},
         })
 
+    if VARIANTS_ON:
+        try:
+            _variants["data"] = build_variants(srcs, n, T, day_idx, params, calib, hourly, daily)
+        except Exception:  # noqa
+            log.exception("variants failed")      # 計算パターンが失敗しても本体の予報は返す
     models = []
     for s in srcs:
         models.append({
@@ -987,6 +1416,7 @@ def ingest_obs(hours=72):
                 pr = _v(rec, "precipitation1h")
                 depth, s1 = _v(rec, "snow"), _v(rec, "snow1h")
                 pres = _v(rec, "pressure")
+                wind, sun = _v(rec, "wind"), _v(rec, "sun1h")
                 if s1 is not None:
                     flag, src = (1 if s1 > 0 else 0), "amedas_snow"
                 elif pr is not None and temp is not None:
@@ -994,17 +1424,17 @@ def ingest_obs(hours=72):
                     flag, src = (1 if (pr > 0 and temp <= 0.5) else 0), "proxy"
                 else:
                     flag, src = None, None
-                rows[t] = (t, temp, rh, pr, depth, s1, pres, flag, src)
+                rows[t] = (t, temp, rh, pr, depth, s1, pres, flag, src, wind, sun)
     n = 0
     with _db_lock, db() as con:
-        for t, temp, rh, pr, depth, s1, pres, flag, src in rows.values():
+        for t, temp, rh, pr, depth, s1, pres, flag, src, wind, sun in rows.values():
             old = con.execute("SELECT flag_src FROM obs WHERE time=?", (t,)).fetchone()
             if old and old["flag_src"] == "manual":
-                con.execute("UPDATE obs SET temp=?, rh=?, precip=?, snow_depth=?, snow1h=?, pressure=? WHERE time=?",
-                            (temp, rh, pr, depth, s1, pres, t))
+                con.execute("UPDATE obs SET temp=?, rh=?, precip=?, snow_depth=?, snow1h=?, pressure=?, wind=?, sun1h=? WHERE time=?",
+                            (temp, rh, pr, depth, s1, pres, wind, sun, t))
             else:
-                con.execute("INSERT OR REPLACE INTO obs VALUES (?,?,?,?,?,?,?,?,?)",
-                            (t, temp, rh, pr, depth, s1, pres, flag, src))
+                con.execute("INSERT OR REPLACE INTO obs(time,temp,rh,precip,snow_depth,snow1h,pressure,snow_flag,flag_src,wind,sun1h) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?)", (t, temp, rh, pr, depth, s1, pres, flag, src, wind, sun))
             n += 1
     return n
 
@@ -1294,50 +1724,6 @@ def api_observations():
     return jsonify({"rows": rows})
 
 
-def daily_results(days=60):
-    """日ごとの実況まとめ（予想バトルの判定用）。
-    status: snow    = その日に雪判定の時間が1時間でもある（その時点で確定）
-            none    = 日が終わっていて、判定できた時間が18時間以上あり雪判定なし
-            pending = まだ決められない（今日の途中・実測の欠け）"""
-    today = now_jst().strftime("%Y-%m-%d")
-    since = (now_jst() - timedelta(days=days)).strftime("%Y-%m-%d")
-    with db() as con:
-        rows = con.execute(
-            "SELECT substr(time,1,10) AS d, COUNT(*) AS n, "
-            "SUM(CASE WHEN snow_flag IS NOT NULL THEN 1 ELSE 0 END) AS nf, "
-            "SUM(CASE WHEN snow_flag=1 THEN 1 ELSE 0 END) AS sn, "
-            "COALESCE(SUM(precip),0) AS pr, MIN(temp) AS tmin, MAX(temp) AS tmax, "
-            "MAX(time) AS last, MIN(CASE WHEN snow_flag=1 THEN time END) AS first_snow, "
-            "SUM(CASE WHEN flag_src='proxy' THEN 1 ELSE 0 END) AS px, "
-            "SUM(CASE WHEN flag_src='manual' THEN 1 ELSE 0 END) AS nm "
-            "FROM obs WHERE substr(time,1,10)>=? GROUP BY d ORDER BY d", (since,)).fetchall()
-    out = []
-    for x in rows:
-        sn, nf = x["sn"] or 0, x["nf"] or 0
-        if sn > 0:
-            st = "snow"
-        elif x["d"] < today and nf >= 18:
-            st = "none"
-        else:
-            st = "pending"
-        out.append({"date": x["d"], "hours": x["n"], "flagged": nf, "snow": sn, "first_snow": x["first_snow"],
-                    "precip": r(x["pr"], 1), "tmin": r(x["tmin"], 1), "tmax": r(x["tmax"], 1), "last": x["last"],
-                    "proxy": x["px"] or 0, "manual": x["nm"] or 0, "status": st})
-    return {"today": today, "updated": now_jst().strftime("%Y-%m-%d %H:%M"), "days": out}
-
-
-@app.route("/api/daily")
-def api_daily():
-    with db() as con:
-        n = con.execute("SELECT COUNT(*) c FROM obs").fetchone()["c"]
-    if n == 0:
-        try:
-            ingest_obs()
-        except Exception as e:  # noqa
-            return jsonify({"error": str(e), "days": []}), 502
-    return jsonify(daily_results(qint("days", 60, 1, 365)))
-
-
 @app.route("/api/observe", methods=["POST"])
 def api_observe():
     """目視などの雪の有無を手動登録。{"time":"2026-12-01T09:00","snow":true}"""
@@ -1368,6 +1754,100 @@ def api_retrain():
     if not authorized():
         return jsonify({"error": "unauthorized"}), 401
     return jsonify(retrain())
+
+
+@app.route("/api/members")
+def api_members():
+    if not _members["data"]:
+        _refresh_async()      # 再起動直後など。裏で予報を作り直す
+        return jsonify({"error": "メンバー別の結果を計算中です。しばらくしてから開き直してください。"})
+    return jsonify(_members["data"])
+
+
+@app.route("/api/variants")
+def api_variants():
+    if not _variants["data"]:
+        _refresh_async()
+        return jsonify({"error": "計算パターンを計算中です。しばらくしてから開き直してください。"})
+    return jsonify(_variants["data"])
+
+
+@app.route("/api/live")
+def api_live():
+    return jsonify(get_live(force=request.args.get("refresh") == "1"))
+
+
+RAW_DET_VARS = ["temperature_2m", "relative_humidity_2m", "precipitation", "pressure_msl", "temperature_850hPa",
+                "wind_speed_10m", "cloud_cover", "snowfall", "freezing_level_height"]
+RAW_ENS_VARS = ["temperature_2m", "relative_humidity_2m", "precipitation", "pressure_msl", "temperature_850hPa"]
+
+
+def _rl(arr, nd):
+    return [None if x is None else round(x, nd) for x in arr]
+
+
+def build_raw(live=None, obs_hours=72):
+    """各データ源の『加工前』のデータをそのまま並べる（データ確認ページ用）。雪判別・統合の結果は含めない。"""
+    fc = _cache["data"] or {}
+    errs = {m["key"]: m.get("error") for m in fc.get("models", []) if m.get("kind") == "error"}
+    info = {m["key"]: m for m in fc.get("models", []) if m.get("kind") != "error"}
+
+    def head(kind, key, label):
+        with _src_lock:
+            hit = _src_cache.get((kind, key))
+        ek = ("ens_" if kind == "ens" else "") + key
+        o = {"key": ek, "label": label, "kind": kind, "ok": bool(hit), "weight": (info.get(ek) or {}).get("weight")}
+        if hit:
+            o["fetched"] = datetime.fromtimestamp(hit[0], JST).strftime("%Y-%m-%d %H:%M")
+        else:
+            o["error"] = errs.get(ek) or "このプロセスではまだ取得していません"
+        return o, (hit[1] if hit else None)
+
+    det, ens = [], []
+    for key, label in DET_MODELS:
+        o, d = head("det", key, label)
+        if d:
+            o["time"] = d["time"]
+            o["grid"] = d.get("grid")
+            o["vars"] = {v: _rl(d[v], 2) for v in RAW_DET_VARS if d.get(v) and any(x is not None for x in d[v])}
+        det.append(o)
+    for key, label in ENS_MODELS:
+        o, d = head("ens", key, label)
+        if d:
+            o["time"] = d["time"]
+            o["grid"] = d.get("grid")
+            o["n"] = len(d["members"])
+            o["vars"] = {}
+            for v in RAW_ENS_VARS:
+                ms = [m.get(v) for m in d["members"]]
+                if ms and all(x is not None for x in ms) and any(x is not None for m in ms for x in m):
+                    o["vars"][v] = [_rl(m, 2 if v == "precipitation" else 1) for m in ms]
+        ens.append(o)
+    since = tstr(hour_floor() - timedelta(hours=obs_hours))
+    try:
+        with db() as con:
+            obs = [dict(x) for x in con.execute("SELECT * FROM obs WHERE time>=? ORDER BY time", (since,))]
+    except Exception:  # noqa
+        obs = []
+    return {"generated_at": now_jst().strftime("%Y-%m-%d %H:%M"), "location": LOCATION,
+            "det": det, "ens": ens, "obs": obs, "live": live or {}}
+
+
+@app.route("/api/raw")
+def api_raw():
+    if not _src_cache:      # 再起動直後など、まだ取得していないときは一度取りに行く
+        try:
+            get_forecast(force=True)
+        except Exception as e:  # noqa
+            return jsonify({"error": str(e)}), 502
+    raw = build_raw(live=get_live())
+    if not raw["obs"]:      # 実測がまだ空なら一度取り込む（/api/observations と同じ扱い）
+        try:
+            ingest_obs()
+            raw = build_raw(live=get_live())
+        except Exception as e:  # noqa
+            log.warning("raw: ingest_obs failed: %s", e)
+    return jsonify(raw)
 
 
 @app.route("/api/params")
@@ -1456,48 +1936,12 @@ th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .sortable{cursor:pointer;user-select:none}
 .foot{font-size:12px;color:var(--sub);padding:0 0 30px}
-/* 予想バトル */
-.cta{margin-top:12px;width:100%;text-align:left;border:1px solid var(--ice);background:rgba(159,211,255,.10);color:var(--tx);border-radius:12px;padding:11px 14px;font-size:14px;font-weight:700;cursor:pointer}
-.cta:focus-visible,.pkb:focus-visible,.st:focus-visible{outline:2px solid var(--ice);outline-offset:2px}
-.card{background:var(--bg2);border:1px solid var(--ln);border-radius:var(--r);padding:14px;margin:0 0 10px}
-.nameRow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-input.txt{background:var(--bg);border:1px solid var(--ln);color:var(--tx);border-radius:10px;padding:9px 11px;font-size:16px;min-width:0;flex:1}
-.live{display:flex;gap:12px;align-items:center}
-.live .big{font-size:38px;line-height:1}
-.live b{font-size:16px}
-.pdays{display:grid;gap:8px}
-.pd{background:var(--bg2);border:1px solid var(--ln);border-radius:14px;padding:12px}
-.pd.hot{border-color:var(--ice)}
-.pd .hd{display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap}
-.pd .ai{font-size:13px;color:var(--sub)}
-.pd .ai b{color:var(--tx)}
-.pk{display:flex;gap:8px;margin-top:10px}
-.pkb{flex:1;min-height:46px;border:1px solid var(--ln);background:var(--bg);color:var(--tx);border-radius:12px;padding:8px 6px;font-size:15px;font-weight:700;cursor:pointer}
-.pkb.on.s{background:var(--ice);color:#06223a;border-color:var(--ice)}
-.pkb.on.n{background:var(--warm);color:#3a2205;border-color:var(--warm)}
-.stars{display:flex;gap:2px;align-items:center;margin-top:8px;font-size:12px;color:var(--sub);flex-wrap:wrap}
-.st{border:0;background:transparent;font-size:24px;line-height:1;cursor:pointer;padding:4px 3px;color:var(--ln)}
-.st.on{color:#ffd45e}
-.stars span{margin-left:6px}
-.others{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px}
-.pill{font-size:12.5px;padding:3px 9px;border-radius:999px;background:var(--bg);border:1px solid var(--ln);color:var(--tx)}
-.pill.ai{border-style:dashed}
-.res .hd{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:baseline}
-.res .lb{font-weight:800}
-.res .dt{font-size:12.5px;color:var(--sub);margin:4px 0 0}
-details.ovr{margin-top:8px;font-size:13px;color:var(--sub)}
-details.ovr summary{cursor:pointer;padding:4px 0}
-details.rule{margin-top:14px;font-size:13px;color:var(--sub)}
-details.rule summary{cursor:pointer;font-weight:700;color:var(--tx)}
-details.rule ul{margin:8px 0 0;padding-left:20px}
-#fx{position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:50}
-.toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom));transform:translateX(-50%);background:var(--tx);color:#0b1424;padding:10px 16px;border-radius:999px;font-size:14px;z-index:60;max-width:90vw;text-align:center}
 </style>
 </head>
 <body>
 <div class="wrap">
 <div class="top"><div class="brand">SNOW CAST<small>甲府市の降雪確率</small></div>
-<button class="iconbtn" id="btnRefresh">更新</button></div>
+<div style="display:flex;gap:8px"><a class="iconbtn" href="/inspect" style="text-decoration:none">データ確認</a><button class="iconbtn" id="btnRefresh">更新</button></div></div>
 
 <div class="hero">
 <h1 id="headline"><span class="skel" style="display:block;width:70%">&nbsp;</span></h1>
@@ -1507,14 +1951,15 @@ details.rule ul{margin:8px 0 0;padding-left:20px}
 <div id="pick"></div>
 <div class="notice" id="notice"></div>
 <div class="note" id="gen">読み込み中…</div>
-<div id="cta"></div>
 </div>
 
 <nav class="tabs" role="tablist">
 <button class="tab" role="tab" data-tab="fc" aria-selected="true">予報</button>
-<button class="tab" role="tab" data-tab="game" aria-selected="false">🎯予想</button>
 <button class="tab" role="tab" data-tab="snow" aria-selected="false">積雪</button>
 <button class="tab" role="tab" data-tab="model" aria-selected="false">モデル比較</button>
+<button class="tab" role="tab" data-tab="mem" aria-selected="false">メンバー</button>
+<button class="tab" role="tab" data-tab="var" aria-selected="false">パターン</button>
+<button class="tab" role="tab" data-tab="live" aria-selected="false">実況・公式</button>
 <button class="tab" role="tab" data-tab="ver" aria-selected="false">精度</button>
 <button class="tab" role="tab" data-tab="data" aria-selected="false">データ</button>
 </nav>
@@ -1525,15 +1970,6 @@ details.rule ul{margin:8px 0 0;padding-left:20px}
 <div class="seg" role="group"><button class="chip on" data-r="48">48時間</button><button class="chip" data-r="120">5日</button><button class="chip" data-r="264">11日</button></div>
 <div class="canvas"><canvas id="cHour"></canvas></div>
 <div class="note">棒: 降雪確率 / 薄い帯: モデル間の最小〜最大 / 線: 気温・湿球温度 / 白線と▲: 過去24時間の実況（気温・雪の判定）。凡例の「気圧」をタップで表示。</div>
-</section>
-
-<section id="s-game">
-<div class="card">
-<div class="nameRow"><label for="gName" class="note" style="margin:0">ニックネーム</label>
-<input class="txt" id="gName" maxlength="12" placeholder="例: ゆうき" autocomplete="nickname"></div>
-<div class="note" style="margin-bottom:0">名前を入れて「降る／降らない」を選ぼう。結果は甲府のアメダス実測で自動判定、Snowcast（AI）とも勝負できます。</div>
-</div>
-<div id="gameRoot"></div>
 </section>
 
 <section id="s-snow">
@@ -1550,6 +1986,41 @@ details.rule ul{margin:8px 0 0;padding-left:20px}
 <h2>直近72時間のモデル別</h2>
 <div class="canvas"><canvas id="cModel"></canvas></div>
 <div class="note">モデルの色が揃っているほど予報の信頼度が高く、ばらけているほど不確実です。</div>
+</section>
+
+<section id="s-var">
+<h2>計算パターン別の降雪確率</h2>
+<div class="note">雪判別の方法とデータソースの組み合わせを変えて、同じ予報データから別々に計算した結果です（1本が1パターン）。ばらつきは「計算方法やデータの選び方による不確実さ」を表します。</div>
+<div class="row" style="gap:8px;flex-wrap:wrap"><select id="varM" style="background:#0b1424;color:#fff;border:1px solid var(--ln);border-radius:8px;padding:7px"></select>
+<select id="varS" style="background:#0b1424;color:#fff;border:1px solid var(--ln);border-radius:8px;padding:7px"></select></div>
+<div class="seg" role="group" style="margin-top:8px"><button class="chip" data-vr="48">48時間</button><button class="chip on" data-vr="120">5日</button><button class="chip" data-vr="264">11日</button>
+<button class="chip on" data-vc="m">色: 計算方法</button><button class="chip" data-vc="s">色: データ</button></div>
+<div class="canvas"><canvas id="cVar"></canvas></div>
+<div class="note">細い線: 各パターン ／ 白い太線: 全パターンの平均 ／ 橙の点線: 現行の統合結果</div>
+<h2>日ごとのばらつき</h2><div class="scroll"><table id="tVarSum"></table></div>
+<h2>パターン × 日別の降雪確率</h2><div class="scroll"><canvas id="varHeat"></canvas></div>
+<div id="varDesc"></div>
+<div class="note" id="varNote">読み込み中…</div>
+</section>
+
+<section id="s-mem">
+<h2>メンバー別の計算結果</h2>
+<div class="row"><select id="memModel" style="background:#0b1424;color:#fff;border:1px solid var(--ln);border-radius:8px;padding:7px"></select></div>
+<div class="seg" role="group" style="margin-top:8px"><button class="chip on" data-mm="depth">積雪深</button><button class="chip" data-mm="cum">累積降雪</button><button class="chip" data-mm="ps">降雪確率(時間別)</button><button class="chip" data-mm="dcm">日別降雪量</button></div>
+<div id="cMemWrap" class="canvas"><canvas id="cMem"></canvas></div>
+<div id="memHeatWrap" style="display:none;margin-top:10px"><canvas id="memHeat"></canvas><div class="scroll"><table id="memRatio"></table></div></div>
+<div class="note" id="memNote">読み込み中…</div>
+</section>
+
+<section id="s-live">
+<h2>警報・注意報（甲府市）</h2><div id="liveWarn" class="note">読み込み中…</div>
+<h2>気象庁 公式予報</h2><div id="liveOff"></div><div class="scroll"><table id="tWeek"></table></div>
+<h2>周辺アメダス（最新10分値）</h2><div id="liveNote" class="note"></div><div class="scroll"><table id="tNear"></table></div>
+<h2>雨雲レーダー（気象庁・5分更新）</h2>
+<div class="row"><button class="iconbtn" id="radPlay">再生</button><span class="note" id="radTime">読み込み中…</span></div>
+<div id="radMap" style="height:340px;border-radius:12px;overflow:hidden;margin-top:8px"></div>
+<div class="note">出典: 気象庁 高解像度降水ナウキャスト（実況＋1時間先まで）／国土地理院タイル。色は降水の強さ（薄い青→赤で強い）。ブラウザが直接取得し、表示中は5分ごとに更新します。</div>
+<div class="note">公式予報・警報・周辺観測は参考表示で、SNOW CAST の降雪確率の計算には使っていません。</div>
 </section>
 
 <section id="s-ver">
@@ -1580,15 +2051,13 @@ details.rule ul{margin:8px 0 0;padding-left:20px}
 <div class="note">見出しをタップすると並べ替えできます。CSVにはモデル別の確率も入っています。</div>
 </section>
 
-<canvas id="fx" aria-hidden="true"></canvas>
-<div id="toast" class="toast" role="status" hidden></div>
 <div class="foot">予報データ: Open-Meteo（気象庁MSM/GSM・ECMWF・NOAA・DWD・GEPS等）、実測: 気象庁アメダス。実験的な独自モデルです。防災判断は気象庁の情報を優先してください。</div>
 </div>
 
 <script>
 const $=s=>document.querySelector(s);
 const WD='日月火水木金土', charts={}, GRID='rgba(255,255,255,.07)', TICK='#8ea3c0';
-const COLORS=['#9fd3ff','#ffc27a','#7be0a1','#ff8fa8','#c9a6ff','#f5e663','#7fdbda','#ff9f6b'];
+const COLORS=['#9fd3ff','#ffc27a','#7be0a1','#ff8fa8','#c9a6ff','#f5e663','#7fdbda','#ff9f6b','#6fa8ff','#e6a1ff','#b6e36b','#ff7a7a','#5fd0b0','#d9c27a','#a0a8ff','#ffb3d9','#9aa5b1'];
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const pct=p=>p==null?'-':Math.round(p*100)+'%';
 const hh=t=>t.slice(5,10).replace('-','/')+' '+t.slice(11,13)+'時';
@@ -1619,9 +2088,6 @@ function drawHero(){
   document.querySelectorAll('.cell').forEach(c=>c.onclick=()=>pick(+c.dataset.i));
   const k=S.findIndex(h=>h.p>=0.3); pick(k>=0?k:0);
   $('#gen').textContent='更新 '+f.generated_at+'（JST） / 湿球しきい値 '+f.params.thr+'℃ / 確率補正: '+(Object.keys(f.calib||{}).length?'実測で学習済み':'未学習');
-  const hot=f.daily.filter(d=>d.date>jstToday()).slice(0,7).reduce((a,d)=>(!a||(d.p||0)>(a.p||0))?d:a,null);
-  $('#cta').innerHTML='<button class="cta" id="goGame">'+(hot&&(hot.p||0)>=.2?'❄️ '+dl(hot.date)+'は雪の可能性 '+pct(hot.p)+'。降るか予想して勝負！':'🎯 雪が降るか予想して遊ぶ')+' →</button>';
-  $('#goGame').onclick=()=>{setTab('game'); $('#s-game').scrollIntoView({behavior:'smooth'});};
   const bad=f.models.filter(m=>m.kind=='error').length;
   $('#notice').textContent=(f.stale?'最新の取得に失敗、または更新中のため、約'+f.age_min+'分前のデータを表示しています。':'')+
     (bad?(f.stale?' ':'')+(f.models.some(m=>m.kind=='error'&&/429|上限/.test(m.error||''))?'予報元（Open-Meteo）の1日の取得上限に達しています。日本時間9時ごろに回復します。':'取得できなかった予報モデルが'+bad+'件あります（「モデル比較」タブで理由を確認できます）。'):'');
@@ -1676,7 +2142,7 @@ function drawModel(){
       D.map(d=>{const v=d.by[m.key];return `<td style="background:${v==null?'transparent':heat(v)}">${v==null?'':pct(v)}</td>`}).join('')+'</tr>').join('')+
     FC.models.filter(m=>m.kind=='error').map(m=>`<tr><td class="err" colspan="${D.length+2}">取得失敗: ${esc(m.label)}　${esc(m.error||'')}</td></tr>`).join('');
   mk('#cModel',{type:'line',data:{labels:H72.map(h=>hh(h.time)),datasets:[
-    ...M.map((m,i)=>({label:m.label,data:H72.map(h=>h.by[m.key]==null?null:h.by[m.key]*100),borderColor:COLORS[i%8],pointRadius:0,borderWidth:1.5,tension:.2})),
+    ...M.map((m,i)=>({label:m.label,data:H72.map(h=>h.by[m.key]==null?null:h.by[m.key]*100),borderColor:COLORS[i%COLORS.length],pointRadius:0,borderWidth:1.5,tension:.2})),
     {label:'統合',data:H72.map(h=>h.p*100),borderColor:'#fff',borderWidth:3,pointRadius:0}]},
     options:{maintainAspectRatio:false,scales:{y:{min:0,max:100,grid:{color:GRID},ticks:{callback:v=>v+'%'}},x:{grid:{display:false},ticks:{maxTicksLimit:6}}},plugins:{legend:{labels:{boxWidth:10,usePointStyle:true}}}}});
 }
@@ -1698,19 +2164,203 @@ async function loadVer(){
 async function loadObs(){
   const o=await fetch('/api/observations?hours=36').then(r=>r.json());
   OBS=o.rows||[]; const R=OBS.slice(-24).reverse();
-  $('#tObs').innerHTML='<tr><th>時刻</th><th>気温</th><th>湿度</th><th>降水1h</th><th>積雪深</th><th>雪判定</th></tr>'+
-   R.map(x=>`<tr><td>${hh(x.time)}</td><td>${x.temp??'-'}</td><td>${x.rh??'-'}</td><td>${x.precip??'-'}</td><td>${x.snow_depth??'-'}</td><td>${x.snow_flag==null?'-':(x.snow_flag?'雪':'なし')}<span class="tag">${x.flag_src||''}</span></td></tr>`).join('');
+  $('#tObs').innerHTML='<tr><th>時刻</th><th>気温</th><th>湿度</th><th>降水1h</th><th>積雪深</th><th>風m/s</th><th>日照h</th><th>雪判定</th></tr>'+
+   R.map(x=>`<tr><td>${hh(x.time)}</td><td>${x.temp??'-'}</td><td>${x.rh??'-'}</td><td>${x.precip??'-'}</td><td>${x.snow_depth??'-'}</td><td>${x.wind??'-'}</td><td>${x.sun1h??'-'}</td><td>${x.snow_flag==null?'-':(x.snow_flag?'雪':'なし')}<span class="tag">${x.flag_src||''}</span></td></tr>`).join('');
+}
+
+/* ---------- 計算パターン ---------- */
+let VAR=null; const VP={m:'all',s:'all',range:120,color:'m'};
+const vSel=()=>VAR.variants.filter(v=>(VP.m=='all'||String(v.m)==VP.m)&&(VP.s=='all'||String(v.s)==VP.s));
+const vShort=v=>VAR.methods[v.m].short+'×'+VAR.sets[v.s].short;
+const vMed=a=>{const b=a.filter(x=>x!=null).sort((x,y)=>x-y); return b.length?b[Math.floor(b.length/2)]:null;};
+function drawVarHeat(list){
+  const cv=$('#varHeat'), dpr=window.devicePixelRatio||1, nd=VAR.days.length, LW=118, RH=12, LH=16;
+  const W=Math.max(cv.parentElement.clientWidth||320, LW+nd*22), H=list.length*RH+LH, cw=(W-LW)/nd;
+  cv.width=W*dpr; cv.height=H*dpr; cv.style.width=W+'px'; cv.style.height=H+'px';
+  const g=cv.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,W,H);
+  g.font='10px sans-serif'; g.textBaseline='middle';
+  list.forEach((v,ri)=>{
+    g.fillStyle=TICK; g.textAlign='left'; g.fillText(vShort(v),0,ri*RH+RH/2);
+    v.d.forEach((p,ci)=>{
+      g.fillStyle=p==null?'rgba(255,255,255,.04)':`rgba(159,211,255,${(0.10+0.90*p).toFixed(2)})`;
+      g.fillRect(LW+ci*cw,ri*RH,cw-1,RH-1);
+      if(p!=null && cw>=26){ g.fillStyle=p>.55?'#06223a':'#cfe3ff'; g.textAlign='center'; g.fillText(Math.round(p*100),LW+ci*cw+cw/2,ri*RH+RH/2); }
+    });
+  });
+  g.fillStyle=TICK; g.textAlign='center'; g.textBaseline='top';
+  VAR.days.forEach((d,ci)=>{ if(cw>=26||ci%2==0) g.fillText(dl(d).replace(/\(.*/,''),LW+ci*cw+cw/2,list.length*RH+3); });
+}
+async function drawVar(){
+  if(!VAR){
+    try{ VAR=await fetch('/api/variants').then(r=>r.json()); }catch(e){ VAR={error:'取得できませんでした。しばらくしてから開き直してください。'}; }
+    if(VAR.error){ $('#varNote').innerHTML='<span class="err">'+esc(VAR.error)+'</span>'; VAR=null; return; }
+  }
+  const sm=$('#varM'), ss=$('#varS');
+  if(!sm.options.length){
+    sm.innerHTML='<option value="all">計算方法: すべて</option>'+VAR.methods.map((m,i)=>`<option value="${i}">${esc(m.label)}</option>`).join('');
+    ss.innerHTML='<option value="all">データ: すべて</option>'+VAR.sets.map((m,i)=>`<option value="${i}">${esc(m.label)}</option>`).join('');
+    sm.onchange=()=>{VP.m=sm.value; drawVar();}; ss.onchange=()=>{VP.s=ss.value; drawVar();};
+    document.querySelectorAll('[data-vr]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-vr]').forEach(x=>x.classList.remove('on'));b.classList.add('on');VP.range=+b.dataset.vr;drawVar();});
+    document.querySelectorAll('[data-vc]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-vc]').forEach(x=>x.classList.remove('on'));b.classList.add('on');VP.color=b.dataset.vc;drawVar();});
+  }
+  const list=vSel(), npt=Math.min(VAR.t.length,Math.ceil(VP.range/3)), labels=VAR.t.slice(0,npt).map(hh);
+  $('#varNote').textContent=list.length+'パターン（'+VAR.issue.replace('T',' ')+' 発表分）。気象庁の公式予報や実況は計算に使っていません。';
+  const pc=x=>x==null?null:x*100, ds=list.map(v=>({label:vShort(v),data:v.p.slice(0,npt).map(pc),
+    borderColor:COLORS[(VP.color=='m'?v.m:v.s)%COLORS.length]+'88',borderWidth:1,pointRadius:0,tension:.15}));
+  ds.push({label:'平均',data:labels.map((_,j)=>{const a=list.map(v=>v.p[j]).filter(x=>x!=null); return a.length?100*a.reduce((x,y)=>x+y,0)/a.length:null;}),borderColor:'#fff',borderWidth:3,pointRadius:0});
+  ds.push({label:'現行',data:VAR.base.p.slice(0,npt).map(pc),borderColor:'#ffc27a',borderWidth:2,borderDash:[5,4],pointRadius:0});
+  mk('#cVar',{type:'line',data:{labels,datasets:ds},options:{animation:false,maintainAspectRatio:false,
+    scales:{y:{min:0,max:100,grid:{color:GRID},ticks:{callback:v=>v+'%'}},x:{grid:{display:false},ticks:{maxTicksLimit:6}}},plugins:{legend:{display:false},tooltip:{enabled:false}}}});
+  $('#tVarSum').innerHTML='<tr><th>日付</th><th>現行</th><th>最小</th><th>中央</th><th>最大</th><th>雪(30%以上)</th></tr>'+VAR.days.map((d,j)=>{
+    const a=list.map(v=>v.d[j]).filter(x=>x!=null), b=VAR.base.d[j]; if(!a.length) return '';
+    const mn=Math.min(...a), mx=Math.max(...a);
+    return `<tr><td>${dl(d)}</td><td style="background:${heat(b||0)};color:#fff">${pct(b)}</td><td>${pct(mn)}</td><td>${pct(vMed(a))}</td><td>${pct(mx)}</td><td>${Math.round(100*a.filter(x=>x>=.3).length/a.length)}%</td></tr>`;}).join('');
+  drawVarHeat(list);
+  $('#varDesc').innerHTML=VAR.methods.map(m=>`<div class="note"><b>${esc(m.label)}</b>: ${esc(m.desc)}</div>`).join('')+VAR.sets.map(m=>`<div class="note"><b>${esc(m.label)}</b>: ${esc(m.desc)}</div>`).join('');
+}
+
+/* ---------- メンバー別 ---------- */
+let MEM=null; const MM={model:'ens',metric:'depth'};
+const MEMTXT={depth:'各線が1メンバー（その予報モデルの1通りの未来）に同じ雪判別と融雪計算を当てた積雪深です。白い太線は平均。線がばらつくほど不確実です。',
+  cum:'各線が1メンバーの累積降雪量です。白い太線は平均。',
+  ps:'縦が1メンバー、横が時間（先頭から約5日、3時間ごと）。濃いほどそのメンバーで雪になる確率が高い時間帯です。',
+  dcm:'縦が1メンバー、横が日付。濃いほどその日の降雪量が多いメンバーです（10cmで最も濃く）。下の表は1cm以上の雪になったメンバーの割合です。'};
+function memHeat(list,metric){
+  const cv=$('#memHeat'), dpr=window.devicePixelRatio||1, W=cv.parentElement.clientWidth||320;
+  const rows=[]; list.forEach(m=>m[metric].forEach(a=>rows.push(a)));
+  const nc=rows.length?rows[0].length:0; if(!nc) return;
+  const RH=rows.length>80?2:rows.length>30?4:10, LH=18, H=rows.length*RH+LH, cw=W/nc;
+  cv.width=W*dpr; cv.height=H*dpr; cv.style.width=W+'px'; cv.style.height=H+'px';
+  const g=cv.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,W,H);
+  rows.forEach((a,ri)=>a.forEach((v,ci)=>{
+    const p=v==null?0:(metric=='ps'?v/100:Math.min(1,v/10));
+    g.fillStyle=p<=0?'rgba(255,255,255,.04)':`rgba(159,211,255,${(0.15+0.85*p).toFixed(2)})`;
+    g.fillRect(ci*cw,ri*RH,cw+0.5,RH>3?RH-1:RH);
+  }));
+  g.fillStyle=TICK; g.font='10px sans-serif'; g.textBaseline='top';
+  const step=metric=='ps'?8:2;
+  for(let ci=0;ci<nc;ci+=step){
+    const t=metric=='ps'?MEM.t[ci].slice(5,10).replace('-','/')+' '+MEM.t[ci].slice(11,13)+'時':dl(MEM.days[ci]).replace(/\(.*/,'');
+    g.fillText(t,ci*cw+1,rows.length*RH+4);
+  }
+  if(metric=='dcm'){
+    $('#memRatio').innerHTML='<tr><th>日付</th>'+MEM.days.map(d=>`<th>${dl(d).replace(/\(.*/,'')}</th>`).join('')+'</tr><tr><td>雪(1cm以上)</td>'
+      +MEM.days.map((d,j)=>`<td>${Math.round(100*rows.filter(a=>(a[j]||0)>=1).length/rows.length)}%</td>`).join('')+'</tr>';
+  } else $('#memRatio').innerHTML='';
+}
+async function drawMem(){
+  if(!MEM){
+    try{ MEM=await fetch('/api/members').then(r=>r.json()); }catch(e){ MEM={error:'取得できませんでした。しばらくしてから開き直してください。'}; }
+    if(MEM.error){ $('#memNote').innerHTML='<span class="err">'+esc(MEM.error)+'</span>'; MEM=null; return; }
+  }
+  const ms=MEM.models, sl=$('#memModel');
+  if(!sl.options.length){
+    sl.innerHTML='<option value="ens">全アンサンブル（'+ms.filter(m=>m.kind=='ens').reduce((a,m)=>a+m.depth.length,0)+'メンバー）</option>'
+      +ms.map(m=>`<option value="${esc(m.key)}">${esc(m.label)}（${m.depth.length}${m.kind=='ens'?'メンバー':'・確定論'}）</option>`).join('');
+    sl.onchange=()=>{MM.model=sl.value; drawMem();};
+    document.querySelectorAll('[data-mm]').forEach(b=>b.onclick=()=>{
+      document.querySelectorAll('[data-mm]').forEach(x=>x.classList.remove('on')); b.classList.add('on'); MM.metric=b.dataset.mm; drawMem();});
+  }
+  const list=MM.model=='ens'?ms.filter(m=>m.kind=='ens'):ms.filter(m=>m.key==MM.model), metric=MM.metric, heatMode=metric=='ps'||metric=='dcm';
+  $('#cMemWrap').style.display=heatMode?'none':'block'; $('#memHeatWrap').style.display=heatMode?'block':'none';
+  $('#memNote').textContent=MEMTXT[metric]+'（'+list.reduce((a,m)=>a+m.depth.length,0)+'メンバー、'+MEM.issue.replace('T',' ')+' 発表分）';
+  if(heatMode){ memHeat(list,metric); return; }
+  const labels=MEM.t.map(hh), ds=[], all=[];
+  list.forEach(m=>{ const ci=ms.indexOf(m); m[metric].forEach(a=>{ all.push(a); ds.push({label:m.label,data:a,borderColor:COLORS[ci%COLORS.length]+'55',borderWidth:1,pointRadius:0,tension:.15}); }); });
+  ds.push({label:'平均',data:labels.map((_,j)=>{const v=all.map(a=>a[j]).filter(x=>x!=null); return v.length?v.reduce((a,b)=>a+b,0)/v.length:null;}),borderColor:'#fff',borderWidth:3,pointRadius:0});
+  mk('#cMem',{type:'line',data:{labels,datasets:ds},options:{animation:false,maintainAspectRatio:false,
+    scales:{y:{min:0,grid:{color:GRID},ticks:{callback:v=>v+'cm'}},x:{grid:{display:false},ticks:{maxTicksLimit:6}}},plugins:{legend:{display:false},tooltip:{enabled:false}}}});
+}
+
+/* ---------- 雨雲レーダー ---------- */
+const RAD={map:null,layer:null,frames:[],i:0,timer:null,loading:false};
+function loadLeaflet(){
+  return new Promise((res,rej)=>{
+    if(window.L) return res();
+    const l=document.createElement('link'); l.rel='stylesheet'; l.href='https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css'; document.head.appendChild(l);
+    const sc=document.createElement('script'); sc.src='https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js'; sc.onload=res; sc.onerror=rej; document.head.appendChild(sc);
+  });
+}
+const jt=t=>t.slice(4,6)+'/'+t.slice(6,8)+' '+t.slice(8,10)+':'+t.slice(10,12);
+async function radarFrames(){
+  const J='https://www.jma.go.jp/bosai/jmatile/data/nowc/';
+  const [a,b]=await Promise.all(['targetTimes_N1.json','targetTimes_N2.json'].map(f=>fetch(J+f).then(r=>r.json())));
+  const ok=x=>(x.elements||[]).includes('hrpns');
+  const past=a.filter(ok).sort((p,q)=>p.validtime<q.validtime?-1:1).slice(-7).map(x=>({b:x.basetime,v:x.validtime,fc:false}));
+  const last=past.length?past[past.length-1].v:'';
+  const seen={}, fut=[];
+  b.filter(ok).sort((p,q)=>p.validtime<q.validtime?-1:1).forEach(x=>{ if(x.validtime>last && !seen[x.validtime]){seen[x.validtime]=1; fut.push({b:x.basetime,v:x.validtime,fc:true});} });
+  return past.concat(fut);
+}
+function radarShow(i){
+  const f=RAD.frames[i]; if(!f||!RAD.map) return;
+  RAD.i=i;
+  const url='https://www.jma.go.jp/bosai/jmatile/data/nowc/'+f.b+'/none/'+f.v+'/surf/hrpns/{z}/{x}/{y}.png';
+  if(RAD.layer) RAD.map.removeLayer(RAD.layer);
+  RAD.layer=L.tileLayer(url,{opacity:.75,minZoom:4,maxZoom:12,maxNativeZoom:10}).addTo(RAD.map);
+  $('#radTime').textContent=jt(f.v)+(f.fc?'（予測）':'（実況）')+'　'+(i+1)+'/'+RAD.frames.length;
+}
+async function radarRefresh(){
+  if(RAD.loading) return; RAD.loading=true;
+  try{
+    RAD.frames=await radarFrames();
+    if(!RAD.frames.length) throw new Error('no frames');
+    const now=RAD.frames.findIndex(f=>f.fc); radarShow(now>0?now-1:RAD.frames.length-1);
+  }catch(e){ $('#radTime').innerHTML='<span class="err">レーダー画像を取得できませんでした。気象庁のサイトで確認してください。</span>'; }
+  finally{ RAD.loading=false; }
+}
+async function initRadar(){
+  if(RAD.map){ RAD.map.invalidateSize(); return; }
+  try{ await loadLeaflet(); }catch(e){ $('#radTime').textContent='地図ライブラリを読み込めませんでした。'; return; }
+  const loc=(FC&&FC.location)||{lat:35.6642,lon:138.5683};
+  RAD.map=L.map('radMap',{zoomControl:true,attributionControl:true}).setView([loc.lat,loc.lon],8);
+  L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png',{minZoom:4,maxZoom:14,attribution:'地理院タイル'}).addTo(RAD.map);
+  L.circleMarker([loc.lat,loc.lon],{radius:6,color:'#fff',weight:2,fillColor:'#ff5a5a',fillOpacity:1}).addTo(RAD.map);
+  $('#radPlay').onclick=()=>{
+    if(RAD.timer){ clearInterval(RAD.timer); RAD.timer=null; $('#radPlay').textContent='再生'; return; }
+    $('#radPlay').textContent='停止';
+    RAD.timer=setInterval(()=>radarShow((RAD.i+1)%Math.max(1,RAD.frames.length)),700);
+  };
+  await radarRefresh();
+  setInterval(()=>{ if(TAB=='live' && !document.hidden) radarRefresh(); },300000);
+}
+
+/* ---------- 実況・公式 ---------- */
+let LIVE=null;
+async function drawLive(){
+  initRadar();
+  if(!LIVE){
+    try{ LIVE=await fetch('/api/live').then(r=>r.json()); }
+    catch(e){ $('#liveWarn').textContent='取得できませんでした。しばらくしてから再度開いてください。'; return; }
+  }
+  const O=LIVE.official||{}, N=LIVE.nearby||{}, W=O.warnings, S=O.short;
+  $('#liveWarn').innerHTML = !W ? '<span class="err">'+esc(O.warning_error||'警報・注意報を取得できませんでした')+'</span>'
+    : (W.items.length ? W.items.map(w=>`<span class="tag" style="font-size:13px;${w.snow?'background:#ffc27a;color:#3a2200':''}">${esc(w.name)}</span>`).join(' ')+`<div class="note">${esc(W.report.replace('T',' '))} 発表</div>`
+    : '<div class="note">現在、発表中の警報・注意報はありません（'+esc(W.report.replace('T',' '))+'）</div>');
+  $('#liveOff').innerHTML = !S ? '<span class="err">'+esc(O.forecast_error||'公式予報を取得できませんでした')+'</span>'
+    : `<div class="note">${esc(O.area_name||'')}　${esc((O.report||'').replace('T',' '))} 発表</div>`
+      +S.weather.map(x=>`<div style="margin:6px 0"><b>${dl(x.date)}</b>　${esc(x.text)}</div>`).join('')
+      +(S.pops.length?'<div class="note">降水確率: '+S.pops.map(p=>`${p.time.slice(8,10)}日${p.time.slice(11,13)}時〜 ${esc(p.pop)}%`).join(' / ')+'</div>':'')
+      +(S.temps.length?'<div class="note">気温(甲府): '+S.temps.map(p=>`${p.time.slice(8,10)}日${p.time.slice(11,13)}時 ${esc(p.temp)}℃`).join(' / ')+'</div>':'');
+  const WK=O.week||[];
+  $('#tWeek').innerHTML = WK.length ? '<tr><th>日付</th><th>降水確率</th><th>信頼度</th><th>最低℃</th><th>最高℃</th></tr>'
+    +WK.map(d=>`<tr><td>${dl(d.date)}</td><td>${d.pop===''?'-':esc(d.pop)+'%'}</td><td>${esc(d.rel||'-')}</td><td>${esc(d.tmin||'-')}</td><td>${esc(d.tmax||'-')}</td></tr>`).join('') : '';
+  const R=N.rows||[], v=x=>x==null?'-':x;
+  $('#liveNote').innerHTML = N.error ? '<span class="err">'+esc(N.error)+'</span>'
+    : `${esc((N.time||'').replace('T',' '))} 観測　周辺${N.summary.stations}地点のうち、雪を観測: <b>${N.summary.snowing}</b>　積雪あり: <b>${N.summary.with_depth}</b>（最大${N.summary.max_depth}cm）`+(N.stale?' <span class="err">（古いデータ）</span>':'');
+  $('#tNear').innerHTML = R.length ? '<tr><th>地点</th><th>距離km</th><th>標高m</th><th>気温</th><th>湿度</th><th>降水1h</th><th>積雪深</th><th>風m/s</th><th>雪判定</th></tr>'
+    +R.map(x=>`<tr><td>${esc(x.name)}</td><td>${x.dist}</td><td>${v(x.alt)}</td><td>${v(x.temp)}</td><td>${v(x.rh)}</td><td>${v(x.precip1h)}</td><td>${v(x.snow_depth)}</td><td>${v(x.wind)}</td><td>${x.snow==null?'-':(x.snow?'雪':'なし')}<span class="tag">${esc(x.basis||'')}</span></td></tr>`).join('') : '';
 }
 
 /* ---------- タブ・操作 ---------- */
 function draw(){
   if(!FC) return;
-  if(TAB=='fc') drawFc(); else if(TAB=='snow') drawSnow(); else if(TAB=='model') drawModel(); else if(TAB=='data') drawData(); else if(TAB=='game') drawGame();
+  if(TAB=='fc') drawFc(); else if(TAB=='snow') drawSnow(); else if(TAB=='model') drawModel(); else if(TAB=='data') drawData(); else if(TAB=='live') drawLive(); else if(TAB=='mem') drawMem(); else if(TAB=='var') drawVar();
   else if(TAB=='ver' && !VERLOADED){VERLOADED=true; loadVer().catch(()=>{$('#ver').textContent='検証データを取得できませんでした。しばらくしてから再度開いてください。';VERLOADED=false;}); loadObs().catch(()=>{});}
 }
 const COLS=[['time','時刻',h=>hh(h.time)],['p','降雪確率',h=>pct(h.p)],['lo','最小',h=>pct(h.lo)],['hi','最大',h=>pct(h.hi)],
   ['agree','一致度',h=>h.agree??'-'],['temp','気温℃',h=>h.temp??'-'],['tw','湿球℃',h=>h.tw??'-'],['precip','降水mm',h=>h.precip??'-'],
-  ['cm','降雪cm',h=>h.cm??'-'],['depth','積雪cm',h=>h.depth??'-'],['pres','気圧hPa',h=>h.pres??'-']];
+  ['cm','降雪cm',h=>h.cm??'-'],['depth','積雪cm',h=>h.depth??'-'],['pres','気圧hPa',h=>h.pres??'-'],['wind','風m/s',h=>h.wind??'-'],['cloud','雲量%',h=>h.cloud??'-'],['frz','0℃高度m',h=>h.frz??'-'],['msnow','モデル降雪cm',h=>h.msnow??'-']];
 function dataRows(){
   let R=FC.hourly.filter(h=>h.p!=null);
   if(DR<999) R=R.slice(0,DR);
@@ -1729,7 +2379,7 @@ async function loadTrend(){ if(!TREND) TREND=await fetch('/api/trend').then(r=>r
 function drawTrend(){
   const T=TREND; if(!T||!T.issues.length){ $('#trendNote').textContent='予報の記録がまだ少ないため、数日たつと表示されます（6時間ごとに記録）。'; return; }
   const ds=Object.entries(T.days).filter(([,v])=>v.length).map(([d,v],i)=>{const m=Object.fromEntries(v.map(x=>[x.issue,TM=='p'&&x.p!=null?x.p*100:x.cm]));
-    return {label:dl(d),data:T.issues.map(t=>m[t]??null),borderColor:COLORS[i%8],backgroundColor:COLORS[i%8],pointRadius:2,borderWidth:2,spanGaps:true,tension:.2};});
+    return {label:dl(d),data:T.issues.map(t=>m[t]??null),borderColor:COLORS[i%COLORS.length],backgroundColor:COLORS[i%COLORS.length],pointRadius:2,borderWidth:2,spanGaps:true,tension:.2};});
   mk('#cTrend',{type:'line',data:{labels:T.issues.map(hh),datasets:ds},options:{maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
     scales:{y:TM=='p'?{min:0,max:100,grid:{color:GRID},ticks:{callback:v=>v+'%'}}:{beginAtZero:true,grid:{color:GRID},ticks:{callback:v=>v+'cm'}},x:{grid:{display:false},ticks:{maxTicksLimit:6}}},
     plugins:{legend:{labels:{boxWidth:10,usePointStyle:true}}}}});
@@ -1751,221 +2401,6 @@ $('#tData').addEventListener('click',e=>{const th=e.target.closest('th[data-k]')
 document.querySelectorAll('[data-dr]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-dr]').forEach(x=>x.classList.remove('on'));b.classList.add('on');DR=+b.dataset.dr;if(FC)drawData();});
 document.querySelectorAll('[data-tm]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tm]').forEach(x=>x.classList.remove('on'));b.classList.add('on');TM=b.dataset.tm;drawTrend();});
 $('#onlySnow').onchange=()=>{if(FC)drawData();};
-
-/* ---------- 予想バトル ---------- */
-const GK='snowcast_game_v1';
-let DAILY=null, G=loadG();
-function loadG(){
-  let g=null; try{g=JSON.parse(localStorage.getItem(GK)||'null');}catch(e){}
-  if(!g||typeof g!=='object') g={};
-  g.u=(typeof g.u==='string'&&/^[a-z0-9]{4,12}$/.test(g.u))?g.u:(Math.random().toString(36).slice(2,8)+Date.now().toString(36).slice(-3));
-  g.name=typeof g.name==='string'?g.name:''; g.stars=[1,2,3].includes(g.stars)?g.stars:2;
-  for(const k of ['players','preds','over','seen']) if(!g[k]||typeof g[k]!=='object') g[k]={};
-  return g;
-}
-function saveG(){ try{localStorage.setItem(GK,JSON.stringify(G));}catch(e){} }
-const jstToday=()=>new Date(Date.now()+9*36e5).toISOString().slice(0,10);
-const nowMin=()=>Math.floor(Date.now()/6e4);
-const deadMin=d=>Date.parse(d+'T00:00:00+09:00')/6e4;      // 締切 = 対象日の0:00(JST)
-const cleanName=v=>String(v||'').replace(/[\u0000-\u001f<>]/g,'').trim().slice(0,12);
-let _tt; function toast(m){const t=$('#toast'); t.textContent=m; t.hidden=false; clearTimeout(_tt); _tt=setTimeout(()=>{t.hidden=true},2800);}
-
-function snowFx(ms=4200){
-  if(matchMedia('(prefers-reduced-motion:reduce)').matches) return;
-  const c=$('#fx'), g=c.getContext('2d'); c.width=innerWidth; c.height=innerHeight;
-  const F=Array.from({length:80},()=>({x:Math.random()*c.width,y:-Math.random()*c.height,r:1.5+Math.random()*4,v:1+Math.random()*2.6,w:Math.random()*6.28}));
-  const t0=performance.now();
-  (function f(t){
-    g.clearRect(0,0,c.width,c.height); if(t-t0>ms) return;
-    g.fillStyle='rgba(255,255,255,.92)';
-    for(const s of F){s.y+=s.v;s.w+=.03;s.x+=Math.sin(s.w)*.8; if(s.y>c.height+8){s.y=-8;s.x=Math.random()*c.width;} g.beginPath();g.arc(s.x,s.y,s.r,0,6.3);g.fill();}
-    requestAnimationFrame(f);
-  })(t0);
-}
-
-/* 判定 */
-function resultOf(date){
-  if(G.over[date]) return {st:G.over[date]==='s'?'snow':'none',man:true,row:DAILY&&DAILY[date]};
-  const row=DAILY&&DAILY[date];
-  return row?{st:row.status,row}:{st:'pending'};
-}
-const pts=(p,st)=>{const hit=(p.k==1)===(st==='snow'); return {hit,pt:hit?10*p.s:-5*p.s};};
-function aiOf(d){      // AIの予想 = 最初に誰かが予想した時点の統合確率(50%以上で「降る」)
-  let b=null; for(const p of Object.values(G.preds)) if(p.d===d&&p.ai!=null&&(!b||p.t<b.t)) b=p;
-  if(!b) return null;
-  const q=b.ai/100, c=Math.max(q,1-q);
-  return {k:q>=.5?1:0,s:c>=.8?3:c>=.65?2:1,ai:b.ai};
-}
-function names(){const n={...G.players}; if(G.name) n[G.u]=G.name; return n;}
-function board(){
-  const nm=names(), stat={ai:{id:'ai',name:'🤖 Snowcast',n:0,hit:0,pt:0,seq:[]}}, h2h={w:0,l:0,d:0};
-  const dates=[...new Set(Object.values(G.preds).map(p=>p.d))].sort();
-  for(const d of dates){
-    const rs=resultOf(d); if(rs.st==='pending') continue;
-    const ai=aiOf(d); let ah=null;
-    if(ai){const o=pts(ai,rs.st),s=stat.ai; s.n++;s.hit+=o.hit;s.pt+=o.pt;s.seq.push(o.hit);ah=o.hit;}
-    for(const p of Object.values(G.preds)) if(p.d===d){
-      const o=pts(p,rs.st), s=stat[p.u]||(stat[p.u]={id:p.u,name:nm[p.u]||'？',n:0,hit:0,pt:0,seq:[]});
-      s.n++;s.hit+=o.hit;s.pt+=o.pt;s.seq.push(o.hit);
-      if(p.u===G.u&&ai){ if(o.hit&&!ah) h2h.w++; else if(!o.hit&&ah) h2h.l++; else h2h.d++; }
-    }
-  }
-  const rows=Object.values(stat).filter(s=>s.n>0).sort((a,b)=>b.pt-a.pt||(b.hit/b.n)-(a.hit/a.n));
-  rows.forEach(s=>{let k=0; for(let i=s.seq.length-1;i>=0&&s.seq[i];i--) k++; s.streak=k;});
-  return {rows,h2h};
-}
-const rankTitle=s=>{if(s.n<3) return ''; const r=s.hit/s.n; return r>=.8?'🔮 雪の預言者':r>=.6?'🌤️ 天気読み':'🌱 修行中';};
-
-/* 操作 */
-function needName(){ if(G.name) return false; toast('先にニックネームを入れてください'); $('#gName').focus(); return true; }
-function setPick(date,k){
-  if(needName()) return;
-  if(date<=jstToday()){toast('この日は締切を過ぎています'); return;}
-  const key=G.u+'|'+date, old=G.preds[key];
-  if(old&&old.k===k){ delete G.preds[key]; saveG(); drawGame(); return; }     // もう一度押すと取り消し
-  const d=FC&&FC.daily.find(x=>x.date===date);
-  G.preds[key]={u:G.u,d:date,k,s:old?old.s:G.stars,ai:old?old.ai:(d&&d.p!=null?Math.round(d.p*100):null),t:nowMin()};
-  saveG(); drawGame();
-}
-function setStars(date,s){
-  const p=G.preds[G.u+'|'+date]; if(!p||date<=jstToday()) return;
-  p.s=s; p.t=nowMin(); G.stars=s; saveG(); drawGame();
-}
-function setOver(date,v){ if(v==='auto') delete G.over[date]; else G.over[date]=v; delete G.seen[date]; saveG(); drawGame(); }
-function resetG(){
-  if(!confirm('この端末の予想データを全部消します（取り込んだ友達の分も消えます）。よろしいですか？')) return;
-  try{localStorage.removeItem(GK);}catch(e){} G=loadG(); $('#gName').value=''; drawGame(); toast('消しました');
-}
-
-/* 共有リンク */
-const b64e=o=>{let bin=''; new TextEncoder().encode(JSON.stringify(o)).forEach(x=>bin+=String.fromCharCode(x)); return btoa(bin).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');};
-const b64d=t=>{t=t.replace(/-/g,'+').replace(/_/g,'/'); while(t.length%4) t+='='; return JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(t),c=>c.charCodeAt(0))));};
-function buildPayload(all){
-  const since=new Date(Date.now()+9*36e5-30*864e5).toISOString().slice(0,10), nm=names(), by={};
-  for(const p of Object.values(G.preds)){ if(p.d<since||(!all&&p.u!==G.u)) continue; (by[p.u]=by[p.u]||[]).push(p); }
-  by[G.u]=by[G.u]||[];
-  const pl=Object.entries(by).filter(([u])=>nm[u]).map(([u,a])=>({u,n:nm[u],
-    p:a.sort((x,y)=>x.d<y.d?1:-1).slice(0,60).map(p=>[p.d.slice(2).replace(/-/g,''),p.k,p.s,p.ai,p.t])}));
-  return {v:1,pl};
-}
-async function shareLink(all){
-  if(needName()) return;
-  const url=location.origin+location.pathname+'#play='+b64e(buildPayload(all));
-  const text='SNOW CAST 雪予想バトル！'+(all?'みんなの予想':G.name+'さんの予想')+'を送ります。リンクを開くと、あなたの画面にも並びます。';
-  if(navigator.share){ try{ await navigator.share({title:'SNOW CAST 予想バトル',text,url}); return; }catch(e){ if(e&&e.name==='AbortError') return; } }
-  try{ await navigator.clipboard.writeText(text+'\n'+url); toast('リンクをコピーしました。友達に送ってね'); }
-  catch(e){ prompt('このリンクをコピーして友達に送ってください',url); }
-}
-function importFromHash(h){
-  let n=0,pn=0;
-  try{
-    const j=b64d(h.slice(5));
-    if(!j||j.v!==1||!Array.isArray(j.pl)) throw 0;
-    for(const pl of j.pl.slice(0,20)){
-      if(!pl||typeof pl.u!=='string'||!/^[a-z0-9]{4,12}$/.test(pl.u)||pl.u===G.u||!Array.isArray(pl.p)) continue;
-      const nm=cleanName(pl.n); if(!nm) continue;
-      let got=0;
-      for(const q of pl.p.slice(0,200)){
-        if(!Array.isArray(q)||!/^\d{6}$/.test(String(q[0]))) continue;
-        const ds=String(q[0]), d='20'+ds.slice(0,2)+'-'+ds.slice(2,4)+'-'+ds.slice(4,6), k=q[1], s=q[2], ai=q[3], t=q[4];
-        if(!(k===0||k===1)||![1,2,3].includes(s)||!(ai===null||(Number.isInteger(ai)&&ai>=0&&ai<=100))||!Number.isInteger(t)) continue;
-        if(isNaN(Date.parse(d+'T00:00:00+09:00'))||t>=deadMin(d)) continue;      // 締切後に作られた予想は無効
-        const key=pl.u+'|'+d, old=G.preds[key];
-        if(!old||old.t<t){ G.preds[key]={u:pl.u,d,k,s,ai,t}; got++; }
-      }
-      if(got>0||G.players[pl.u]){ G.players[pl.u]=nm; pn++; n+=got; }
-    }
-    saveG();
-    toast(pn?(n>0?pn+'人の予想を取り込みました（新着 '+n+'件）':'すでに取り込み済みです'):'有効な予想が見つかりませんでした');
-  }catch(e){ toast('リンクを読み取れませんでした'); }
-}
-
-/* 描画 */
-function liveHtml(){
-  if(!DAILY) return '<div class="note" style="margin:0">実況を読み込み中…</div>';
-  const t=jstToday(), row=DAILY[t];
-  if(!row) return '<div class="note" style="margin:0">今日の実況データがまだありません。</div>';
-  const snow=row.snow>0, wet=row.precip>0, ic=snow?'❄️':wet?'🌧️':'☀️';
-  const msg=snow?'雪の判定が出ています（'+row.snow+'時間）':wet?'雪ではなく雨（降水 '+row.precip+'mm）':'いまのところ雪も雨もなし';
-  return `<div class="live"><div class="big">${ic}</div><div><b>${msg}</b><div class="note" style="margin:2px 0 0">${dl(t)} ${row.last?(+row.last.slice(11,13))+'時までの甲府の実測':''}　気温 ${row.tmin??'-'}〜${row.tmax??'-'}℃</div></div></div>`;
-}
-const pill=(name,p,ai,st)=>{
-  let t=esc(name)+' '+(p.k?'❄️':'☀️')+(ai?('（雪'+p.ai+'%）'):'★'.repeat(p.s));
-  if(st&&st!=='pending'){const o=pts(p,st); t+=' '+(o.hit?'✅':'❌')+' '+(o.pt>0?'+':'')+o.pt;}
-  return `<span class="pill${ai?' ai':''}">${t}</span>`;
-};
-function rowHtml(d){
-  const mine=G.preds[G.u+'|'+d.date], nm=names();
-  const others=Object.values(G.preds).filter(p=>p.d===d.date&&p.u!==G.u);
-  const on=k=>!!(mine&&mine.k===k);
-  return `<div class="pd${(d.p||0)>=.3?' hot':''}"><div class="hd"><b>${dl(d.date)}</b>
-    <span class="ai">🤖 Snowcast <b>${pct(d.p)}</b> ${ico(d.p||0)} ${d.tmin!=null?Math.round(d.tmin)+'〜'+Math.round(d.tmax)+'℃':''}</span></div>
-    <div class="pk"><button class="pkb s${on(1)?' on':''}" data-act="pick" data-d="${d.date}" data-k="1" aria-pressed="${on(1)}">❄️ 降る</button>
-    <button class="pkb n${on(0)?' on':''}" data-act="pick" data-d="${d.date}" data-k="0" aria-pressed="${on(0)}">☀️ 降らない</button></div>
-    ${mine?`<div class="stars">自信 ${[1,2,3].map(n=>`<button class="st${n<=mine.s?' on':''}" data-act="star" data-d="${d.date}" data-s="${n}" aria-label="自信 星${n}">★</button>`).join('')}<span>${['','弱気','ふつう','強気'][mine.s]}：当たり +${10*mine.s}pt / ハズレ −${5*mine.s}pt</span></div>`:''}
-    ${others.length?`<div class="others">${others.map(p=>pill(nm[p.u]||'？',p)).join('')}</div>`:''}</div>`;
-}
-function resultsHtml(){
-  const today=jstToday(), nm=names();
-  const ds=[...new Set(Object.values(G.preds).map(p=>p.d))].filter(d=>d<=today).sort().reverse().slice(0,12);
-  if(!ds.length) return '<div class="note">まだ結果の出た予想はありません。明日以降の予想を選ぶと、その日の夜に結果が出ます。</div>';
-  return ds.map(d=>{
-    const rs=resultOf(d), row=rs.row, ai=aiOf(d);
-    const lb=rs.st==='snow'?'❄️ 雪が降りました':rs.st==='none'?(row&&row.precip>0?'🌧️ 雪は降らず（雨）':'☀️ 雪は降りませんでした'):'⏳ 判定待ち';
-    const dt=row?`実測 ${row.hours}時間分 ／ 雪判定 ${row.snow}時間${row.first_snow?'（最初 '+(+row.first_snow.slice(11,13))+'時）':''} ／ 気温 ${row.tmin??'-'}〜${row.tmax??'-'}℃ ／ 降水 ${row.precip??0}mm${row.proxy>0&&row.manual==0?' ／ 簡易判定':''}`:'実測データがありません';
-    const ps=Object.values(G.preds).filter(p=>p.d===d).sort((a,b)=>a.t-b.t);
-    return `<div class="card res"><div class="hd"><b>${dl(d)}</b><span class="lb">${lb}${rs.man?'（目視で判定）':''}</span></div>
-      <div class="dt">${dt}</div>
-      <div class="others">${ai?pill('🤖 Snowcast',ai,true,rs.st):''}${ps.map(p=>pill(p.u===G.u?(G.name||'あなた'):(nm[p.u]||'？'),p,false,rs.st)).join('')}</div>
-      <details class="ovr"><summary>判定を直す（目視）</summary><div class="seg" style="margin:6px 0 0"><button class="chip" data-act="over" data-d="${d}" data-v="s">降った</button><button class="chip" data-act="over" data-d="${d}" data-v="n">降らなかった</button><button class="chip" data-act="over" data-d="${d}" data-v="auto">自動に戻す</button></div>
-      <div class="note">この端末の表示だけが変わります。雨雪の境目で自動判定と実感がずれたときにどうぞ。</div></details></div>`;
-  }).join('');
-}
-function boardHtml(){
-  const b=board();
-  if(!b.rows.length) return '<div class="note">結果の出た予想がまだないので、ランキングは判定が出てから表示されます。</div>';
-  let h='';
-  const g=b.h2h; if(g.w+g.l+g.d>0) h+=`<div class="card">🆚 <b>あなた vs Snowcast</b>　${g.w}勝 ${g.l}敗 ${g.d}分<div class="note" style="margin:2px 0 0">どちらか一方だけ当てた日が勝ち負けです。</div></div>`;
-  h+='<div class="scroll"><table><tr><th>順位</th><th>名前</th><th>pt</th><th>的中</th><th>連勝</th></tr>'+
-    b.rows.map((s,i)=>`<tr><td>${i+1}</td><td>${esc(s.name)}${s.id===G.u?'<span class="tag">あなた</span>':''}${rankTitle(s)?'<span class="tag">'+rankTitle(s)+'</span>':''}</td><td><b>${s.pt}</b></td><td>${s.hit}/${s.n}（${Math.round(s.hit/s.n*100)}%）</td><td>${s.streak>=2?'🔥':''}${s.streak}</td></tr>`).join('')+'</table></div>';
-  return h;
-}
-function drawGame(){
-  const root=$('#gameRoot'); if(!root) return;
-  const today=jstToday(), up=(FC?FC.daily:[]).filter(d=>d.date>today).slice(0,7);
-  root.innerHTML='<h2>今日の実況</h2><div class="card">'+liveHtml()+'</div>'+
-    '<h2>予想する（締切は前日の24時）</h2>'+(FC?'<div class="pdays">'+up.map(rowHtml).join('')+'</div>':'<div class="skel"></div>')+
-    '<div class="note">もう一度押すと取り消せます。他の人の予想は、リンクを取り込むとここに並びます。</div>'+
-    '<h2>結果発表</h2>'+resultsHtml()+
-    '<h2>ランキング</h2>'+boardHtml()+
-    '<h2>友達と遊ぶ</h2><div class="card"><div class="note" style="margin-top:0">リンクを友達に送ると、あなたの予想が友達の画面に並びます。友達のリンクを開くと、その人の予想があなたの画面に入ります。予想はこの端末のブラウザに保存され、リンクで送らない限り誰にも見られません。</div>'+
-    '<div class="row"><button class="iconbtn" data-act="share" data-all="0">自分の予想を送る</button><button class="iconbtn" data-act="share" data-all="1">みんなの分をまとめて送る</button><button class="iconbtn" data-act="reset">データを消す</button></div></div>'+
-    '<details class="rule"><summary>ルール</summary><ul>'+
-    '<li>対象は甲府のアメダス。その日（0〜23時）に雪の判定が1時間でも出れば「降った」です。</li>'+
-    '<li>雪の判定は、積雪計が無い場合は「降水があり気温0.5℃以下」の簡易判定です。ずれたら「判定を直す」で目視判定にできます。</li>'+
-    '<li>予想は前日24時まで。自信（★1〜3）が高いほど、当たれば +10pt×★、外せば −5pt×★。</li>'+
-    '<li>🤖 Snowcast は、最初に予想が入った時点の統合降雪確率が50%以上なら「降る」。確率の偏りが大きいほど自信が高い扱いです。</li>'+
-    '<li>雪の判定が出た日は、その時点で結果が確定します。雪なしは日が終わってから確定します。</li></ul></details>';
-  const fresh=[...new Set(Object.values(G.preds).map(p=>p.d))].filter(d=>d<=today&&!G.seen[d]&&resultOf(d).st==='snow');
-  if(fresh.length){ fresh.forEach(d=>G.seen[d]=1); saveG(); snowFx(); }
-}
-async function loadDaily(){
-  const j=await fetch('/api/daily?days=60').then(r=>r.json());
-  DAILY=Object.fromEntries((j.days||[]).map(x=>[x.date,x]));
-  if(TAB=='game') drawGame();
-}
-$('#gameRoot').addEventListener('click',e=>{
-  const b=e.target.closest('[data-act]'); if(!b) return;
-  const a=b.dataset.act, d=b.dataset.d;
-  if(a==='pick') setPick(d,+b.dataset.k); else if(a==='star') setStars(d,+b.dataset.s);
-  else if(a==='over') setOver(d,b.dataset.v); else if(a==='share') shareLink(b.dataset.all==='1'); else if(a==='reset') resetG();
-});
-addEventListener('hashchange',()=>{const h=location.hash.slice(1); if(h.startsWith('play=')){importFromHash(h); setTab('game');}});
-$('#gName').value=G.name;
-$('#gName').addEventListener('change',e=>{
-  const v=cleanName(e.target.value); e.target.value=v; if(!v) return;
-  G.name=v; saveG(); toast('「'+v+'」で参加中'); drawGame();
-});
 
 function setTab(t){
   TAB=t;
@@ -2017,14 +2452,11 @@ $('#btnTrain').onclick=async()=>{
 };
 
 (async()=>{
-  const h=location.hash.slice(1);
-  if(h.startsWith('play=')){ importFromHash(h); TAB='game'; }
-  else if(['fc','game','snow','model','ver','data'].includes(h)) TAB=h;
-  loadDaily().catch(()=>{});
+  const h=location.hash.slice(1); if(['fc','snow','model','mem','var','live','ver','data'].includes(h)) TAB=h;
   await loadForecast(false);
   setTab(TAB);
   loadObs().then(()=>{if(TAB=='fc'&&FC)drawHour();}).catch(()=>{});
-  setInterval(()=>{loadForecast(false); loadDaily().catch(()=>{});}, 30*60*1000);
+  setInterval(()=>loadForecast(false), 30*60*1000);
 })();
 </script>
 </body></html>
@@ -2034,6 +2466,12 @@ $('#btnTrain').onclick=async()=>{
 @app.route("/")
 def index():
     return Response(INDEX_HTML, mimetype="text/html")
+
+
+@app.route("/inspect")
+def inspect_page():
+    from viewer import VIEWER_HTML
+    return Response(VIEWER_HTML, mimetype="text/html")
 
 
 # ----------------------------------------------------------------------------

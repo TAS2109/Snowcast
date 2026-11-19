@@ -2,7 +2,7 @@
 
   1) 前回のDB(snowcast.sqlite.gz)を復元
   2) アメダス実測の取り込み → 1日1回の再学習 → 予報の再計算（スナップショット保存も app.py と同じ）
-  3) site/ に index.html と data/*.json（forecast / verification / observations / trend / daily）を出力 → GitHub Pages で公開
+  3) site/ に index.html と data/*.json を出力 → GitHub Pages で公開
   4) DBを snowcast.sqlite.gz に固めて返す（ワークフローが専用ブランチへ保存）
 
 app.py は変更不要。Render 版と同じ計算ロジックをそのまま使う。
@@ -30,14 +30,29 @@ def static_html(src):
         ("fetch('/api/verification?days=30')", "fetch('data/verification.json?'+Date.now())"),
         ("fetch('/api/observations?hours=36')", "fetch('data/observations.json?'+Date.now())"),
         ("fetch('/api/trend')", "fetch('data/trend.json?'+Date.now())"),
-        ("fetch('/api/daily?days=60')", "fetch('data/daily.json?'+Date.now())"),
+        ("fetch('/api/live')", "fetch('data/live.json?'+Date.now())"),
+        ("fetch('/api/members')", "fetch('data/members.json?'+Date.now())"),
+        ("fetch('/api/variants')", "fetch('data/variants.json?'+Date.now())"),
         ("fetch('/api/forecast'+(force?'?refresh=1':''))", "fetch('data/forecast.json?'+Date.now())"),
+        ('href="/inspect"', 'href="inspect.html"'),
     ]
     for old, new in pairs:
         assert src.count(old) == 1, "画面側のfetch箇所が見つかりません: " + old
         src = src.replace(old, new)
     # 再学習ボタンはサーバが無いので隠す（学習は毎日自動で実行される）
     return src.replace("</style>", "#btnTrain,#trainRes{display:none}\n</style>", 1)
+
+
+def static_viewer(src):
+    """データ確認ページ(viewer.py)を、サーバ無し（data/raw.json 読み込み）用に書き換える。"""
+    pairs = [
+        ("fetch('/api/raw')", "fetch('data/raw.json?'+Date.now())"),
+        ('href="/"', 'href="index.html"'),
+    ]
+    for old, new in pairs:
+        assert src.count(old) == 1, "データ確認ページ側の置換箇所が見つかりません: " + old
+        src = src.replace(old, new)
+    return src
 
 
 def main(patch=None):
@@ -84,14 +99,30 @@ def main(patch=None):
         obs = [dict(x) for x in con.execute("SELECT * FROM obs WHERE time>=? ORDER BY time", (since,))]
     ver = A.verification(30)
     trend = A.forecast_trend()
-    daily = A.daily_results(60)       # 予想バトルの判定用（日ごとの実況まとめ）
+    try:
+        live = A.get_live(force=True)       # 公式予報・警報・周辺アメダス
+    except Exception as e:  # noqa
+        log("live failed:", e)
+        live = {"official": {"error": str(e)[:200]}, "nearby": {"error": str(e)[:200]}}
+
+    try:
+        raw = A.build_raw(live=live)         # 各データ源の加工前データ（データ確認ページ用）
+    except Exception as e:  # noqa
+        log("raw failed:", e)
+        raw = {"error": "データ確認用のデータを作れませんでした: " + str(e)[:200]}
 
     os.makedirs(os.path.join(SITE, "data"), exist_ok=True)
-    for name, obj in (("forecast", fc), ("verification", ver), ("observations", {"rows": obs}), ("trend", trend), ("daily", daily)):
+    for name, obj in (("forecast", fc), ("verification", ver), ("observations", {"rows": obs}), ("trend", trend), ("live", live),
+                      ("members", A._members["data"] or {"error": "メンバー別の結果は今回の更新では作れませんでした"}),
+                      ("variants", A._variants["data"] or {"error": "計算パターンは今回の更新では作れませんでした"}),
+                      ("raw", raw)):
         with open(os.path.join(SITE, "data", name + ".json"), "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
     with open(os.path.join(SITE, "index.html"), "w", encoding="utf-8") as f:
         f.write(static_html(A.INDEX_HTML))
+    from viewer import VIEWER_HTML
+    with open(os.path.join(SITE, "inspect.html"), "w", encoding="utf-8") as f:
+        f.write(static_viewer(VIEWER_HTML))
     open(os.path.join(SITE, ".nojekyll"), "w").close()
 
     # DBを固めて保存用に出力（WALをDBに取り込んでから）
