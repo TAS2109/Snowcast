@@ -6,7 +6,7 @@ on:
   workflow_dispatch: {}       # 手動実行ボタン
   push:
     branches: [main]
-    paths: ["app.py", "build_static.py", ".github/workflows/snowcast.yml"]
+    paths: ["app.py", "build_static.py", "viewer.py", ".github/workflows/snowcast.yml"]
 
 permissions:
   contents: write
