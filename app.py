@@ -48,6 +48,7 @@ import json
 import logging
 import math
 import os
+import socket
 import sqlite3
 import threading
 import time
@@ -159,6 +160,34 @@ _cache = {"time": 0, "data": None}
 _src_cache = {}     # (kind, model) -> (取得時刻, データ)
 _src_lock = threading.Lock()
 _blocked = {}       # ホスト名 -> 上限解除の時刻(epoch)
+
+# --- 接続の安定化 -----------------------------------------------------------
+# 「_ssl.c:994: The handshake operation timed out」対策。
+#  1) IPv6経路が不通/低速な環境で、IPv6を先に試して握手が固まる → 既定でIPv4を優先
+#     （SNOWCAST_IPV4=0 で無効化）
+#  2) 全モデルを一斉に新規TLS接続すると握手が詰まる → ホストごとの同時接続数を制限
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _getaddrinfo_v4first(host, port, family=0, type=0, proto=0, flags=0):
+    res = _orig_getaddrinfo(host, port, family, type, proto, flags)
+    v4 = [r for r in res if r[0] == socket.AF_INET]
+    return v4 + [r for r in res if r[0] != socket.AF_INET] if v4 else res
+
+
+if os.environ.get("SNOWCAST_IPV4", "1") != "0":
+    socket.getaddrinfo = _getaddrinfo_v4first
+
+_HOST_SEM = {}
+_HOST_SEM_LOCK = threading.Lock()
+HOST_CONCURRENCY = int(os.environ.get("SNOWCAST_HOST_CONCURRENCY", "3"))
+
+
+def _host_sem(host):
+    with _HOST_SEM_LOCK:
+        if host not in _HOST_SEM:
+            _HOST_SEM[host] = threading.BoundedSemaphore(HOST_CONCURRENCY)
+        return _HOST_SEM[host]
 _last_fresh = [0.0]
 _train_lock = threading.Lock()
 _live_lock = threading.Lock()
@@ -199,8 +228,9 @@ def http_get(url, params=None, timeout=25, retries=2, ua=None):
     for k in range(retries + 1):
         try:
             req = urlrequest.Request(url, headers={"User-Agent": ua or "SNOWCAST/1.0"})
-            with urlrequest.urlopen(req, timeout=timeout) as r:
-                return r.read().decode("utf-8")
+            with _host_sem(host):
+                with urlrequest.urlopen(req, timeout=timeout) as r:
+                    return r.read().decode("utf-8")
         except urlerror.HTTPError as e:
             try:
                 body = e.read().decode("utf-8", "replace")
@@ -219,7 +249,8 @@ def http_get(url, params=None, timeout=25, retries=2, ua=None):
         except Exception as e:  # noqa
             last = e
             if k < retries:
-                time.sleep(0.8 * (k + 1))
+                # 接続/TLS握手のタイムアウトは混雑が原因のことが多いので長めに待つ
+                time.sleep((2.5 if "timed out" in str(e) else 0.8) * (k + 1))
     raise last
 
 
@@ -597,7 +628,7 @@ def fetch_det(model):
                 p.pop("elevation", None)
                 p["forecast_days"] = 7
             p.update({"models": model, "hourly": ",".join(vars_)})
-            js = http_json(url, p)
+            js = http_json(url, p, retries=3)
             h = js["hourly"]
             out = {"time": h["time"], "grid": {"lat": js.get("latitude"), "lon": js.get("longitude")}}
             for v in vars_:
