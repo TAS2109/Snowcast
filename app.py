@@ -313,6 +313,29 @@ def p_snow_given_precip(tw, t2, t850, thr, scale):
     return sigmoid(z)
 
 
+def current_t850():
+    """予報モデルの「いま」の850hPa気温（取得済みの確定論モデルの中央値）。(値, モデル数) を返す。
+    アメダスに上空観測は無いので、各モデルの現在時刻の値で代用する。取得済みデータが無ければ (None, 0)。"""
+    now = now_jst().strftime("%Y-%m-%dT%H:00")
+    vals = []
+    with _src_lock:
+        items = [(k, v) for k, v in _src_cache.items() if k[0] == "det"]
+    for _k, (_t, d) in items:
+        try:
+            i = d["time"].index(now)
+            v = d["temperature_850hPa"][i]
+        except Exception:  # noqa
+            continue
+        if v is not None:
+            vals.append(v)
+    if not vals:
+        return None, 0
+    vals.sort()
+    m = len(vals) // 2
+    med = vals[m] if len(vals) % 2 else (vals[m - 1] + vals[m]) / 2
+    return round(med, 1), len(vals)
+
+
 def classify_phase(temp, rh, params, t850=None):
     """現在の気温・湿度から、降水があった場合の種類（雪/みぞれ/雨）と雪の確率[%]を返す。
     湿球温度＋雪判別エンジン（p_snow_given_precip）を流用。気温・湿度が欠測なら (None, None, None)。"""
@@ -886,7 +909,7 @@ def amedas_neighbors(radius=50, k=10):
     return sel
 
 
-def _amedas_row(code, name, dist, alt, rec, self_=False, lat=None, lon=None, params=None):
+def _amedas_row(code, name, dist, alt, rec, self_=False, lat=None, lon=None, params=None, t850=None):
     temp, rh = _v(rec, "temp"), _v(rec, "humidity")
     p10, p1 = _v(rec, "precipitation10m"), _v(rec, "precipitation1h")
     depth, s1 = _v(rec, "snow"), _v(rec, "snow1h")
@@ -897,7 +920,7 @@ def _amedas_row(code, name, dist, alt, rec, self_=False, lat=None, lon=None, par
         snow, basis = (1 if (pr > 0 and temp <= 0.5) else 0), "推定"
     else:
         snow, basis = None, ""
-    phase, p_snow, tw = classify_phase(temp, rh, params or get_params())
+    phase, p_snow, tw = classify_phase(temp, rh, params or get_params(), t850)
     if pr is not None and pr > 0 and s1 is not None and s1 > 0 and phase in ("雨", "雨まじりのみぞれ"):
         phase = "雪まじりのみぞれ"          # 実測で降雪があれば、雨と判定しない
     return {"code": code, "name": name, "dist": dist, "alt": alt, "lat": lat, "lon": lon, "self": self_, "temp": temp, "rh": rh,
@@ -914,15 +937,16 @@ def fetch_nearby():
     snap = http_json("%s/map/%s.json" % (base, dt.strftime("%Y%m%d%H%M%S")), timeout=25, retries=1)
     rows = []
     prm = get_params()
+    t850, t850_n = current_t850()
     me = snap.get(LOCATION["amedas"])
     if me:
-        rows.append(_amedas_row(LOCATION["amedas"], LOCATION["name"] + "（自地点）", 0, LOCATION["elev"], me, True, LOCATION["lat"], LOCATION["lon"], prm))
+        rows.append(_amedas_row(LOCATION["amedas"], LOCATION["name"] + "（自地点）", 0, LOCATION["elev"], me, True, LOCATION["lat"], LOCATION["lon"], prm, t850))
     for st in amedas_neighbors():
         rec = snap.get(st["code"])
         if rec:
-            rows.append(_amedas_row(st["code"], st["name"], st["dist"], st["alt"], rec, False, st.get("lat"), st.get("lon"), prm))
+            rows.append(_amedas_row(st["code"], st["name"], st["dist"], st["alt"], rec, False, st.get("lat"), st.get("lon"), prm, t850))
     nb = [x for x in rows if not x["self"]]
-    return {"time": dt.strftime("%Y-%m-%dT%H:%M"), "rows": rows,
+    return {"time": dt.strftime("%Y-%m-%dT%H:%M"), "rows": rows, "t850": t850, "t850_n": t850_n,
             "summary": {"stations": len(nb), "snowing": sum(1 for x in nb if x["snow"] == 1),
                         "with_depth": sum(1 for x in nb if (x["snow_depth"] or 0) > 0),
                         "max_depth": max([x["snow_depth"] or 0 for x in nb], default=0)}}
@@ -2558,8 +2582,8 @@ async function drawLive(){
   const me=R.find(x=>x.self);
   $('#livePhase').innerHTML = !me||!me.phase ? (N.error?'<span class="err">'+esc(N.error)+'</span>':'気温・湿度が取得できないため判別できません。')
     : `<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap"><span style="font-size:30px;font-weight:700;color:${PHC[me.phase]||'inherit'}">${esc(me.phase)}</span>`
-      +`<span>${me.raining?'<b>いま降水を観測中</b>':'いまは降水なし（降った場合の判別）'}<br>雪の確率 <b>${me.p_snow}%</b>　気温 ${v(me.temp)}℃　湿度 ${v(me.rh)}%　湿球温度 ${v(me.tw)}℃</span></div>`
-      +`<div class="note">${esc((N.time||'').replace('T',' '))} のアメダス値から、湿球温度などで判別（雪75%以上＝雪、50〜75%＝雪まじりのみぞれ、25〜50%＝雨まじりのみぞれ、25%未満＝雨）。上空の気温は使っていないため、目安です。</div>`;
+      +`<span>${me.raining?'<b>いま降水を観測中</b>':'いまは降水なし（降った場合の判別）'}<br>雪の確率 <b>${me.p_snow}%</b>　気温 ${v(me.temp)}℃　湿度 ${v(me.rh)}%　湿球温度 ${v(me.tw)}℃<br>上空(850hPa約1500m) ${N.t850==null?'<span class="err">取得できず（地上のみで判別）</span>':'<b>'+N.t850+'℃</b>（予報'+N.t850_n+'モデルの中央値）'}</span></div>`
+      +`<div class="note">${esc((N.time||'').replace('T',' '))} のアメダス値から、湿球温度などで判別（雪75%以上＝雪、50〜75%＝雪まじりのみぞれ、25〜50%＝雨まじりのみぞれ、25%未満＝雨）。上空の気温は予報モデルの現在値で代用しているため、目安です。</div>`;
   $('#liveNote').innerHTML = N.error ? '<span class="err">'+esc(N.error)+'</span>'
     : `${esc((N.time||'').replace('T',' '))} 観測　周辺${N.summary.stations}地点のうち、雪を観測: <b>${N.summary.snowing}</b>　積雪あり: <b>${N.summary.with_depth}</b>（最大${N.summary.max_depth}cm）`+(N.stale?' <span class="err">（古いデータ）</span>':'');
   $('#tNear').innerHTML = R.length ? '<tr><th>地点</th><th>距離km</th><th>標高m</th><th>気温</th><th>湿度</th><th>降水1h</th><th>積雪深</th><th>風m/s</th><th>雪判定</th><th>降るなら</th></tr>'
