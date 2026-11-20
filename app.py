@@ -313,6 +313,24 @@ def p_snow_given_precip(tw, t2, t850, thr, scale):
     return sigmoid(z)
 
 
+def classify_phase(temp, rh, params, t850=None):
+    """現在の気温・湿度から、降水があった場合の種類（雪/みぞれ/雨）と雪の確率[%]を返す。
+    湿球温度＋雪判別エンジン（p_snow_given_precip）を流用。気温・湿度が欠測なら (None, None, None)。"""
+    if temp is None or rh is None:
+        return None, None, None
+    tw = wet_bulb(temp, rh)
+    ps = p_snow_given_precip(tw, temp, t850, params["thr"], params["scale"])
+    if ps >= 0.75:
+        label = "雪"
+    elif ps >= 0.5:
+        label = "雪まじりのみぞれ"
+    elif ps >= 0.25:
+        label = "雨まじりのみぞれ"
+    else:
+        label = "雨"
+    return label, round(ps * 100), round(tw, 1)
+
+
 SLR_PTS = [(-10, 18), (-5, 14), (-2, 11), (0, 8), (1, 6), (2, 4)]
 
 
@@ -628,7 +646,7 @@ def fetch_det(model):
                 p.pop("elevation", None)
                 p["forecast_days"] = 7
             p.update({"models": model, "hourly": ",".join(vars_)})
-            js = http_json(url, p, retries=3)
+            js = http_json(url, p, retries=3, timeout=12)
             h = js["hourly"]
             out = {"time": h["time"], "grid": {"lat": js.get("latitude"), "lon": js.get("longitude")}}
             for v in vars_:
@@ -868,7 +886,7 @@ def amedas_neighbors(radius=50, k=10):
     return sel
 
 
-def _amedas_row(code, name, dist, alt, rec, self_=False, lat=None, lon=None):
+def _amedas_row(code, name, dist, alt, rec, self_=False, lat=None, lon=None, params=None):
     temp, rh = _v(rec, "temp"), _v(rec, "humidity")
     p10, p1 = _v(rec, "precipitation10m"), _v(rec, "precipitation1h")
     depth, s1 = _v(rec, "snow"), _v(rec, "snow1h")
@@ -879,7 +897,11 @@ def _amedas_row(code, name, dist, alt, rec, self_=False, lat=None, lon=None):
         snow, basis = (1 if (pr > 0 and temp <= 0.5) else 0), "推定"
     else:
         snow, basis = None, ""
+    phase, p_snow, tw = classify_phase(temp, rh, params or get_params())
+    if pr is not None and pr > 0 and s1 is not None and s1 > 0 and phase in ("雨", "雨まじりのみぞれ"):
+        phase = "雪まじりのみぞれ"          # 実測で降雪があれば、雨と判定しない
     return {"code": code, "name": name, "dist": dist, "alt": alt, "lat": lat, "lon": lon, "self": self_, "temp": temp, "rh": rh,
+            "phase": phase, "p_snow": p_snow, "tw": tw, "raining": (None if pr is None else pr > 0),
             "precip1h": p1, "snow_depth": depth, "snow1h": s1, "wind": _v(rec, "wind"),
             "sun1h": _v(rec, "sun1h"), "snow": snow, "basis": basis}
 
@@ -891,13 +913,14 @@ def fetch_nearby():
     dt = datetime.fromisoformat(latest)
     snap = http_json("%s/map/%s.json" % (base, dt.strftime("%Y%m%d%H%M%S")), timeout=25, retries=1)
     rows = []
+    prm = get_params()
     me = snap.get(LOCATION["amedas"])
     if me:
-        rows.append(_amedas_row(LOCATION["amedas"], LOCATION["name"] + "（自地点）", 0, LOCATION["elev"], me, True, LOCATION["lat"], LOCATION["lon"]))
+        rows.append(_amedas_row(LOCATION["amedas"], LOCATION["name"] + "（自地点）", 0, LOCATION["elev"], me, True, LOCATION["lat"], LOCATION["lon"], prm))
     for st in amedas_neighbors():
         rec = snap.get(st["code"])
         if rec:
-            rows.append(_amedas_row(st["code"], st["name"], st["dist"], st["alt"], rec, False, st.get("lat"), st.get("lon")))
+            rows.append(_amedas_row(st["code"], st["name"], st["dist"], st["alt"], rec, False, st.get("lat"), st.get("lon"), prm))
     nb = [x for x in rows if not x["self"]]
     return {"time": dt.strftime("%Y-%m-%dT%H:%M"), "rows": rows,
             "summary": {"stations": len(nb), "snowing": sum(1 for x in nb if x["snow"] == 1),
@@ -937,6 +960,19 @@ def fetch_all(fresh=False):
             except Exception as e:  # noqa
                 errors[("ens_" if kind == "ens" else "") + key] = str(e)[:200]
                 log.warning("fetch %s %s failed: %s", kind, key, e)
+    # 接続/TLS握手のタイムアウトで落ちたものは、混雑が引いた後に1本ずつ再取得する
+    for kind, key, _f in jobs:
+        ek = ("ens_" if kind == "ens" else "") + key
+        if "timed out" not in errors.get(ek, ""):
+            continue
+        try:
+            time.sleep(1.5)
+            fn = fetch_ens if kind == "ens" else CUSTOM_DET.get(key, fetch_det)
+            (det if kind == "det" else ens)[key] = _cached_fetch(kind, key, fn, True)
+            errors.pop(ek, None)
+        except Exception as e:  # noqa
+            errors[ek] = str(e)[:200]
+            log.warning("retry %s %s failed: %s", kind, key, e)
     return det, ens, errors
 
 
@@ -2067,6 +2103,7 @@ th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:
 </section>
 
 <section id="s-live">
+<h2>いま降るなら、何で降る？（甲府）</h2><div id="livePhase" class="note">読み込み中…</div>
 <h2>警報・注意報（甲府市）</h2><div id="liveWarn" class="note">読み込み中…</div>
 <h2>気象庁 公式予報</h2><div id="liveOff"></div><div class="scroll"><table id="tWeek"></table></div>
 <h2>周辺アメダス（最新10分値）</h2><div id="liveNote" class="note"></div><div class="scroll"><table id="tNear"></table></div>
@@ -2517,10 +2554,16 @@ async function drawLive(){
   $('#tWeek').innerHTML = WK.length ? '<tr><th>日付</th><th>降水確率</th><th>信頼度</th><th>最低℃</th><th>最高℃</th></tr>'
     +WK.map(d=>`<tr><td>${dl(d.date)}</td><td>${d.pop===''?'-':esc(d.pop)+'%'}</td><td>${esc(d.rel||'-')}</td><td>${esc(d.tmin||'-')}</td><td>${esc(d.tmax||'-')}</td></tr>`).join('') : '';
   const R=N.rows||[], v=x=>x==null?'-':x;
+  const PHC={'雪':'#9fd3ff','雪まじりのみぞれ':'#b8c8ff','雨まじりのみぞれ':'#c9b8e8','雨':'#6fa8ff'};
+  const me=R.find(x=>x.self);
+  $('#livePhase').innerHTML = !me||!me.phase ? (N.error?'<span class="err">'+esc(N.error)+'</span>':'気温・湿度が取得できないため判別できません。')
+    : `<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap"><span style="font-size:30px;font-weight:700;color:${PHC[me.phase]||'inherit'}">${esc(me.phase)}</span>`
+      +`<span>${me.raining?'<b>いま降水を観測中</b>':'いまは降水なし（降った場合の判別）'}<br>雪の確率 <b>${me.p_snow}%</b>　気温 ${v(me.temp)}℃　湿度 ${v(me.rh)}%　湿球温度 ${v(me.tw)}℃</span></div>`
+      +`<div class="note">${esc((N.time||'').replace('T',' '))} のアメダス値から、湿球温度などで判別（雪75%以上＝雪、50〜75%＝雪まじりのみぞれ、25〜50%＝雨まじりのみぞれ、25%未満＝雨）。上空の気温は使っていないため、目安です。</div>`;
   $('#liveNote').innerHTML = N.error ? '<span class="err">'+esc(N.error)+'</span>'
     : `${esc((N.time||'').replace('T',' '))} 観測　周辺${N.summary.stations}地点のうち、雪を観測: <b>${N.summary.snowing}</b>　積雪あり: <b>${N.summary.with_depth}</b>（最大${N.summary.max_depth}cm）`+(N.stale?' <span class="err">（古いデータ）</span>':'');
-  $('#tNear').innerHTML = R.length ? '<tr><th>地点</th><th>距離km</th><th>標高m</th><th>気温</th><th>湿度</th><th>降水1h</th><th>積雪深</th><th>風m/s</th><th>雪判定</th></tr>'
-    +R.map(x=>`<tr><td>${esc(x.name)}</td><td>${x.dist}</td><td>${v(x.alt)}</td><td>${v(x.temp)}</td><td>${v(x.rh)}</td><td>${v(x.precip1h)}</td><td>${v(x.snow_depth)}</td><td>${v(x.wind)}</td><td>${x.snow==null?'-':(x.snow?'雪':'なし')}<span class="tag">${esc(x.basis||'')}</span></td></tr>`).join('') : '';
+  $('#tNear').innerHTML = R.length ? '<tr><th>地点</th><th>距離km</th><th>標高m</th><th>気温</th><th>湿度</th><th>降水1h</th><th>積雪深</th><th>風m/s</th><th>雪判定</th><th>降るなら</th></tr>'
+    +R.map(x=>`<tr><td>${esc(x.name)}</td><td>${x.dist}</td><td>${v(x.alt)}</td><td>${v(x.temp)}</td><td>${v(x.rh)}</td><td>${v(x.precip1h)}</td><td>${v(x.snow_depth)}</td><td>${v(x.wind)}</td><td>${x.snow==null?'-':(x.snow?'雪':'なし')}<span class="tag">${esc(x.basis||'')}</span></td><td>${x.phase?esc(x.phase)+' <span class="tag">'+x.p_snow+'%</span>':'-'}</td></tr>`).join('') : '';
 }
 
 /* ---------- タブ・操作 ---------- */
