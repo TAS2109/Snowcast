@@ -1,12 +1,14 @@
 name: snowcast
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: "17 * * * *"      # 毎時17分（予報元の更新は1日4回程度なので1時間おきで十分）
-  workflow_dispatch: {}       # 手動実行ボタン
-  push:
-    branches: [main]
-    paths: ["app.py", "build_static.py", "viewer.py", ".github/workflows/snowcast.yml"]
+    - cron: "17 */3 * * *"   # 予備（今の設定があるなら、そのまま残してOK）
+
+concurrency:
+  group: snowcast
+  cancel-in-progress: false
+
 
 permissions:
   contents: write
