@@ -1227,7 +1227,11 @@ def build_forecast(det=None, ens=None, errors=None, start=None, fresh=False):
         def avg(field, runs=runs):
             return [mean([rn[field][i] for rn in runs]) for i in range(n)]
 
+        def pdep(th, runs=runs):
+            return [mean([1.0 if (rn["depth"][i] or 0.0) >= th else 0.0 for rn in runs]) for i in range(n)]
+
         s["m"] = {"ps": avg("ps"), "cm": avg("cm"), "depth": avg("depth"), "tw": avg("tw"),
+                  "pd1": pdep(1.0), "pd5": pdep(5.0),
                   "temp": [mean([m["temp"][i] for m in s["members"]]) for i in range(n)],
                   "rh": [mean([m["rh"][i] for m in s["members"]]) for i in range(n)],
                   "precip": [mean([m["precip"][i] for m in s["members"]]) for i in range(n)],
@@ -1317,6 +1321,7 @@ def build_forecast(det=None, ens=None, errors=None, start=None, fresh=False):
             "agree": r(1.0 - min(1.0, std / 0.5), 2),
             "temp": r(wavg("temp"), 1), "tw": r(wavg("tw"), 1), "precip": r(wavg("precip"), 2),
             "cm": r(wavg("cm"), 2), "depth": r(wavg("depth"), 1),
+            "pd1": r(wavg("pd1"), 3), "pd5": r(wavg("pd5"), 3),
             "pres": r(pres, 1), "dp6": r(dp6, 1),
             "wind": r(wavg("wind"), 1), "cloud": r(wavg("cloud"), 0), "frz": r(wavg("frz"), 0),
             "msnow": r(wavg("fsnow"), 2),
@@ -2069,21 +2074,24 @@ th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:
 </div>
 
 <nav class="tabs" role="tablist">
-<button class="tab" role="tab" data-tab="fc" aria-selected="true">予報</button>
-<button class="tab" role="tab" data-tab="snow" aria-selected="false">積雪</button>
-<button class="tab" role="tab" data-tab="map" aria-selected="false">マップ</button>
-<button class="tab" role="tab" data-tab="live" aria-selected="false">実況・公式</button>
-<button class="tab" role="tab" data-tab="model" aria-selected="false">モデル</button>
-<button class="tab" role="tab" data-tab="ver" aria-selected="false">検証</button>
+<button class="tab" role="tab" data-tab="long" aria-selected="true">長期予測</button>
+<button class="tab" role="tab" data-tab="near" aria-selected="false">直前予測</button>
+<button class="tab" role="tab" data-tab="now" aria-selected="false">実況</button>
 </nav>
 <div class="subtabs" id="subtabs" role="tablist" hidden></div>
 
 <section id="s-fc" class="on">
 <h2>11日間の雪予報</h2><div class="days" id="days"></div>
+</section>
+
+<section id="s-hour">
 <h2>1時間ごとの降雪確率</h2>
 <div class="seg" role="group"><button class="chip on" data-r="48">48時間</button><button class="chip" data-r="120">5日</button><button class="chip" data-r="264">11日</button></div>
 <div class="canvas"><canvas id="cHour"></canvas></div>
 <div class="note">棒: 降雪確率 / 薄い帯: モデル間の最小〜最大 / 線: 気温・湿球温度 / 白線と▲: 過去24時間の実況（気温・雪の判定）。凡例の「気圧」をタップで表示。</div>
+<h2>積雪（時間別）</h2>
+<div class="canvas"><canvas id="cHourSnow"></canvas></div>
+<div class="note">面: 積雪1cm以上の確率 / 点線: 5cm以上の確率 / 緑線: 予想積雪深 / 棒: 時間降雪量 / 白線: 過去の実況の積雪深。確率は各モデル・メンバーの積雪深がしきい値を超える割合を重み付けして統合した値です。</div>
 </section>
 
 <section id="s-snow">
@@ -2126,16 +2134,45 @@ th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:
 <div class="note" id="memNote">読み込み中…</div>
 </section>
 
-<section id="s-live">
-<h2>いま降るなら、何で降る？（甲府）</h2><div id="livePhase" class="note">読み込み中…</div>
-<h2>警報・注意報（甲府市）</h2><div id="liveWarn" class="note">読み込み中…</div>
+<section id="s-off">
 <h2>気象庁 公式予報</h2><div id="liveOff"></div><div class="scroll"><table id="tWeek"></table></div>
-<h2>周辺アメダス（最新10分値）</h2><div id="liveNote" class="note"></div><div class="scroll"><table id="tNear"></table></div>
+<div class="note">公式予報・警報・周辺観測は参考表示で、SNOW CAST の降雪確率の計算には使っていません。</div>
+</section>
+
+<section id="s-nbr">
+<h2>周辺アメダス（最新10分値）</h2><div class="note">直前の様子を、甲府の周辺の観測点から確認できます。</div>
+<div id="liveNote" class="note"></div><div class="scroll"><table id="tNear"></table></div>
+</section>
+
+<section id="s-rad">
 <h2>雨雲レーダー（気象庁・5分更新）</h2>
+
 <div class="row"><button class="iconbtn" id="radPlay">再生</button><span class="note" id="radTime">読み込み中…</span></div>
 <div id="radMap" style="height:340px;border-radius:12px;overflow:hidden;margin-top:8px"></div>
 <div class="note">出典: 気象庁 高解像度降水ナウキャスト（実況＋1時間先まで）／国土地理院タイル。色は降水の強さ（薄い青→赤で強い）。ブラウザが直接取得し、表示中は5分ごとに更新します。</div>
-<div class="note">公式予報・警報・周辺観測は参考表示で、SNOW CAST の降雪確率の計算には使っていません。</div>
+</section>
+
+<section id="s-up">
+<h2>上空の気温（850hPa・約1500m）</h2>
+<div id="upBox" class="note">読み込み中…</div>
+</section>
+
+<section id="s-kofu">
+<h2>甲府の現況（アメダス）</h2>
+<div id="kofuBox" class="note">読み込み中…</div>
+</section>
+
+<section id="s-phase">
+<h2>いま降るなら、何で降る？（甲府）</h2><div id="livePhase" class="note">読み込み中…</div>
+</section>
+
+<section id="s-obs">
+<h2>直近のアメダス実測（甲府）</h2>
+<div class="scroll"><table id="tObs"></table></div>
+</section>
+
+<section id="s-warn">
+<h2>警報・注意報（甲府市）</h2><div id="liveWarn" class="note">読み込み中…</div>
 </section>
 
 <section id="s-ver">
@@ -2146,8 +2183,6 @@ th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:
 <div class="note">予報確率に近いほど良好です。</div>
 <div class="scroll"><table id="tRel"></table></div>
 <div class="row" style="margin-top:12px"><button class="iconbtn" id="btnTrain">実測から再学習</button><span class="note" id="trainRes"></span></div>
-<h2>直近のアメダス実測（甲府）</h2>
-<div class="scroll"><table id="tObs"></table></div>
 </section>
 
 <section id="s-map">
@@ -2246,6 +2281,19 @@ function drawHour(){
     options:{maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
       scales:{y:{min:0,max:100,grid:{color:GRID},ticks:{callback:v=>v+'%'}},y2:{position:'right',grid:{display:false},ticks:{callback:v=>v+'℃'}},y3:{position:'right',display:'auto',grid:{display:false}},x:{grid:{display:false},ticks:{maxTicksLimit:6}}},
       plugins:{legend:{labels:{boxWidth:10,usePointStyle:true}},nowLine:{i:np?np:null}}}});
+  drawHourSnow(H,past,np,pad,tail);
+}
+function drawHourSnow(H,past,np,pad,tail){
+  const f=(h,k)=>h[k]==null?null:h[k]*100;
+  mk('#cHourSnow',{plugins:[nowLine],data:{labels:past.map(r=>hh(r.time)).concat(H.map(h=>hh(h.time))),datasets:[
+    {type:'bar',label:'降雪量(cm/h)',data:pad(H.map(h=>h.cm)),backgroundColor:'rgba(159,211,255,.45)',yAxisID:'y2',order:3},
+    {type:'line',label:'積雪1cm以上の確率(%)',data:pad(H.map(h=>f(h,'pd1'))),borderColor:'#f2f7ff',backgroundColor:'rgba(242,247,255,.12)',fill:true,pointRadius:0,borderWidth:2,yAxisID:'y',order:2},
+    {type:'line',label:'5cm以上の確率(%)',data:pad(H.map(h=>f(h,'pd5'))),borderColor:COLORS[3],pointRadius:0,borderWidth:1.5,borderDash:[4,3],yAxisID:'y',order:2},
+    {type:'line',label:'予想積雪深(cm)',data:pad(H.map(h=>h.depth)),borderColor:COLORS[2],pointRadius:0,borderWidth:2,yAxisID:'y2',order:1},
+    {type:'line',label:'実況の積雪深(cm)',data:past.map(r=>r.snow_depth).concat(tail),borderColor:'#fff',pointRadius:0,borderWidth:2,yAxisID:'y2',order:1}]},
+    options:{maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
+      scales:{y:{min:0,max:100,grid:{color:GRID},ticks:{callback:v=>v+'%'}},y2:{position:'right',beginAtZero:true,grid:{display:false},ticks:{callback:v=>v+'cm'}},x:{grid:{display:false},ticks:{maxTicksLimit:6}}},
+      plugins:{legend:{labels:{boxWidth:10,usePointStyle:true}},nowLine:{i:np?np:null}}}});
 }
 function drawFc(){
   const D=FC.daily;
@@ -2253,8 +2301,8 @@ function drawFc(){
     <div class="p">${pct(d.p)}</div><div class="bar"><i style="width:${(d.p||0)*100}%"></i></div>
     <div class="z">${word(d.p||0)}</div>
     <div class="s">${d.tmin!=null?Math.round(d.tmin)+'〜'+Math.round(d.tmax)+'℃':''}</div>
-    <div class="s">降雪 ${d.cm??'-'}cm</div></div>`).join('');
-  drawHour();
+    <div class="s">降雪 ${d.cm??'-'}cm</div>
+    <div class="s">積雪1cm↑ ${pct(d.d1)}</div></div>`).join('');
 }
 function drawSnow(){
   const D=FC.daily;
@@ -2453,7 +2501,7 @@ async function initRadar(){
     RAD.timer=setInterval(()=>radarShow((RAD.i+1)%Math.max(1,RAD.frames.length)),700);
   };
   await radarRefresh();
-  setInterval(()=>{ if(TAB=='live' && !document.hidden) radarRefresh(); },300000);
+  setInterval(()=>{ if(TAB=='rad' && !document.hidden) radarRefresh(); },300000);
 }
 
 /* ---------- マップ ---------- */
@@ -2562,7 +2610,6 @@ async function drawMap(){
 let LIVE=null;
 async function ensureLive(){ if(!LIVE) LIVE=await fetch('/api/live').then(r=>r.json()); return LIVE; }
 async function drawLive(){
-  initRadar();
   try{ await ensureLive(); }
   catch(e){ $('#liveWarn').textContent='取得できませんでした。しばらくしてから再度開いてください。'; return; }
   const O=LIVE.official||{}, N=LIVE.nearby||{}, W=O.warnings, S=O.short;
@@ -2584,6 +2631,17 @@ async function drawLive(){
     : `<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap"><span style="font-size:30px;font-weight:700;color:${PHC[me.phase]||'inherit'}">${esc(me.phase)}</span>`
       +`<span>${me.raining?'<b>いま降水を観測中</b>':'いまは降水なし（降った場合の判別）'}<br>雪の確率 <b>${me.p_snow}%</b>　気温 ${v(me.temp)}℃　湿度 ${v(me.rh)}%　湿球温度 ${v(me.tw)}℃<br>上空(850hPa約1500m) ${N.t850==null?'<span class="err">取得できず（地上のみで判別）</span>':'<b>'+N.t850+'℃</b>（予報'+N.t850_n+'モデルの中央値）'}</span></div>`
       +`<div class="note">${esc((N.time||'').replace('T',' '))} のアメダス値から、湿球温度などで判別（雪75%以上＝雪、50〜75%＝雪まじりのみぞれ、25〜50%＝雨まじりのみぞれ、25%未満＝雨）。上空の気温は予報モデルの現在値で代用しているため、目安です。</div>`;
+  $('#upBox').innerHTML = N.t850==null ? '<span class="err">取得できませんでした（予報モデルの値がまだありません）</span>'
+    : `<div style="font-size:30px;font-weight:700">${N.t850}℃</div><div class="note">予報${N.t850_n}モデルの現在時刻の中央値。アメダスに上空の観測はないため、モデルの値で代用した目安です。</div>`;
+  $('#kofuBox').innerHTML = !me ? (N.error?'<span class="err">'+esc(N.error)+'</span>':'甲府のデータを取得できませんでした。')
+    : (()=>{ const head = me.snow==1 ? '雪が降っています' : (me.raining ? esc(me.phase||'降水')+'が降っています' : '降水はありません'),
+        dep = me.snow_depth==null ? '-' : (me.snow_depth>0 ? me.snow_depth+'cm' : '積雪なし');
+      return `<div class="note" style="margin:0 0 8px">${esc(me.name||'甲府')}　${esc((N.time||'').replace('T',' '))} 観測${N.stale?' <span class="err">（古いデータ）</span>':''}</div>`
+      +`<div class="row" style="gap:22px;flex-wrap:wrap;align-items:flex-end"><div><div class="note" style="margin:0">いまの降り方</div><div style="font-size:26px;font-weight:700">${head}</div></div>`
+      +`<div><div class="note" style="margin:0">積雪深</div><div style="font-size:26px;font-weight:700">${dep}</div></div></div>`
+      +'<div class="row" style="gap:18px;flex-wrap:wrap;margin-top:12px">'+[['降水1h',v(me.precip1h)+'mm'],['降雪1h',v(me.snow1h)+'cm'],['気温',v(me.temp)+'℃'],['湿度',v(me.rh)+'%'],['湿球温度',v(me.tw)+'℃'],['風',v(me.wind)+'m/s']]
+        .map(([k,x])=>`<div><div class="note" style="margin:0">${k}</div><div style="font-size:18px;font-weight:700">${x}</div></div>`).join('')+'</div>'
+      +`<div class="note">雪の判定: ${me.snow==null?'-':(me.snow?'雪':'雪ではない')}${me.basis?'（'+esc(me.basis)+'）':''}。降雪1hは観測がない場合「-」になります。</div>`; })();
   $('#liveNote').innerHTML = N.error ? '<span class="err">'+esc(N.error)+'</span>'
     : `${esc((N.time||'').replace('T',' '))} 観測　周辺${N.summary.stations}地点のうち、雪を観測: <b>${N.summary.snowing}</b>　積雪あり: <b>${N.summary.with_depth}</b>（最大${N.summary.max_depth}cm）`+(N.stale?' <span class="err">（古いデータ）</span>':'');
   $('#tNear').innerHTML = R.length ? '<tr><th>地点</th><th>距離km</th><th>標高m</th><th>気温</th><th>湿度</th><th>降水1h</th><th>積雪深</th><th>風m/s</th><th>雪判定</th><th>降るなら</th></tr>'
@@ -2593,7 +2651,7 @@ async function drawLive(){
 /* ---------- タブ・操作 ---------- */
 function draw(){
   if(!FC) return;
-  if(TAB=='fc') drawFc(); else if(TAB=='snow') drawSnow(); else if(TAB=='model') drawModel(); else if(TAB=='data') drawData(); else if(TAB=='trend') drawTrendTab(); else if(TAB=='map') drawMap(); else if(TAB=='live') drawLive(); else if(TAB=='mem') drawMem(); else if(TAB=='var') drawVar();
+  if(TAB=='fc') drawFc(); else if(TAB=='hour') drawHour(); else if(TAB=='snow') drawSnow(); else if(TAB=='model') drawModel(); else if(TAB=='data') drawData(); else if(TAB=='trend') drawTrendTab(); else if(TAB=='map') drawMap(); else if(['off','nbr','up','kofu','phase','warn'].includes(TAB)) drawLive(); else if(TAB=='rad') initRadar(); else if(TAB=='obs') loadObs().catch(()=>{}); else if(TAB=='mem') drawMem(); else if(TAB=='var') drawVar();
   else if(TAB=='ver' && !VERLOADED){VERLOADED=true; loadVer().catch(()=>{$('#ver').textContent='検証データを取得できませんでした。しばらくしてから再度開いてください。';VERLOADED=false;}); loadObs().catch(()=>{});}
 }
 const COLS=[['time','時刻',h=>hh(h.time)],['p','降雪確率',h=>pct(h.p)],['lo','最小',h=>pct(h.lo)],['hi','最大',h=>pct(h.hi)],
@@ -2641,11 +2699,13 @@ document.querySelectorAll('[data-tm]').forEach(b=>b.onclick=()=>{document.queryS
 $('#onlySnow').onchange=()=>{if(FC)drawData();};
 
 /* 画面（ページ）= TAB。上のタブは「グループ」、モデル／検証だけ下に小タブが出る */
-const GROUPS={fc:['fc'],snow:['snow'],map:['map'],live:['live'],model:['model','mem','var'],ver:['ver','trend','data']};
-const SUBLABEL={model:'モデル比較',mem:'メンバー別',var:'計算パターン',ver:'精度',trend:'予報の推移',data:'時間別データ'};
+const GROUPS={long:['fc','snow','off','model','mem','var','trend'],near:['hour','nbr','rad','up','map','data'],now:['kofu','phase','obs','warn','ver']};
+const ALIAS={live:'kofu'};
+const SUBLABEL={fc:'日別予報',model:'モデル比較',mem:'メンバー別',var:'計算パターン',trend:'予報の推移',hour:'時間別予報',snow:'積雪（日別）',data:'時間別データ',off:'公式予報',nbr:'周辺アメダス',rad:'雨雲レーダー',up:'上空気温',map:'マップ',kofu:'甲府の現況',phase:'いま降るなら',obs:'直近の実測',warn:'警報・注意報',ver:'精度（検証）'};
 const GROUP_OF={}; Object.entries(GROUPS).forEach(([g,ps])=>ps.forEach(p=>GROUP_OF[p]=g));
 const LASTSUB={};
 function setTab(t){
+  t=ALIAS[t]||t;
   if(!GROUP_OF[t]) t='fc';
   TAB=t; const g=GROUP_OF[t]; LASTSUB[g]=t;
   document.querySelectorAll('.tab').forEach(b=>b.setAttribute('aria-selected',b.dataset.tab==g));
@@ -2700,10 +2760,10 @@ $('#btnTrain').onclick=async()=>{
 };
 
 (async()=>{
-  const h=location.hash.slice(1); if(GROUP_OF[h]) TAB=h;
+  const h0=location.hash.slice(1), h=ALIAS[h0]||h0; if(GROUP_OF[h]) TAB=h;
   await loadForecast(false);
   setTab(TAB);
-  loadObs().then(()=>{if(TAB=='fc'&&FC)drawHour();}).catch(()=>{});
+  loadObs().then(()=>{if(TAB=='hour'&&FC)drawHour();}).catch(()=>{});
   setInterval(()=>loadForecast(false), 30*60*1000);
 })();
 </script>
